@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+
+pdf_conversion.log
+conversion_state.json
+pdf_to_convert/*.pdf
+converted_word/
+pdf_backup/
+
+.venv/
+venv/
+env/
+.idea/
+.vscode/
