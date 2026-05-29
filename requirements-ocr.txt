@@ -1,0 +1,4 @@
+paddleocr==2.10.0
+# Install PaddlePaddle separately for your OS/Python version.
+# Linux CPU example:
+# python -m pip install paddlepaddle -i https://www.paddlepaddle.org.cn/packages/stable/cpu/

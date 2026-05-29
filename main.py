@@ -2,6 +2,7 @@ import PyPDF2
 import pymupdf as fitz
 from docx import Document
 from docx.shared import Inches
+from docx.shared import Pt
 import io
 from PIL import Image
 import os
@@ -15,10 +16,42 @@ import threading
 from queue import Queue
 import json
 
+os.environ.setdefault("FLAGS_use_mkldnn", "0")
+os.environ.setdefault("FLAGS_use_onednn", "0")
+
 try:
     from pdf2docx import Converter
 except ImportError:
     Converter = None
+
+try:
+    from docxcompose.composer import Composer
+except ImportError:
+    Composer = None
+
+try:
+    import cv2
+    import numpy as np
+    from paddleocr import PaddleOCR, PPStructure
+    from paddleocr.ppstructure.recovery.recovery_to_doc import (
+        convert_info_docx,
+        sorted_layout_boxes,
+    )
+except ImportError:
+    cv2 = None
+    np = None
+    PaddleOCR = None
+    PPStructure = None
+    convert_info_docx = None
+    sorted_layout_boxes = None
+
+PADDLE_LANG = os.getenv("PADDLE_LANG", "en")
+PADDLE_OCR_LANG = os.getenv("PADDLE_OCR_LANG", "ru")
+OCR_DPI = int(os.getenv("OCR_DPI", "300"))
+OCR_GPU = os.getenv("OCR_GPU", "0").lower() in ("1", "true", "yes")
+PADDLE_CPU_THREADS = int(os.getenv("PADDLE_CPU_THREADS", "4"))
+PADDLE_FALLBACK_TO_OCR = os.getenv("PADDLE_FALLBACK_TO_OCR", "1").lower() in ("1", "true", "yes")
+CONVERT_MODE = os.getenv("CONVERT_MODE", "auto").lower()
 
 # Настройка логирования
 logging.basicConfig(
@@ -40,6 +73,8 @@ class PDFPipelineConverter:
         self.input_folder = Path(input_folder)
         self.output_folder = Path(output_folder)
         self.backup_folder = Path(backup_folder) if backup_folder else None
+        self.paddle_structure_engine = None
+        self.paddle_ocr_engine = None
         
         # Статистика
         self.stats = {
@@ -123,19 +158,309 @@ class PDFPipelineConverter:
                 pdf_document.close()
         
         return images_content
+
+    def is_scanned_pdf(self, pdf_path, min_text_chars=40, pages_to_check=3):
+        """Проверяет, есть ли в PDF текстовый слой."""
+        pdf_document = None
+        try:
+            pdf_document = fitz.open(pdf_path)
+            text = []
+            for page_index in range(min(pdf_document.page_count, pages_to_check)):
+                page = pdf_document[page_index]
+                text.append(page.get_text("text") or "")
+            return len("".join(text).strip()) < min_text_chars
+        except Exception as e:
+            logging.warning(f"Failed to detect PDF type for {pdf_path.name}: {e}")
+            return False
+        finally:
+            if pdf_document:
+                pdf_document.close()
+
+    def convert_scanned_pdf_to_docx(self, pdf_path, docx_path):
+        """OCR-конвертация сканированного PDF в DOCX через PaddleOCR PP-Structure."""
+        if (
+            cv2 is None
+            or np is None
+            or PPStructure is None
+            or sorted_layout_boxes is None
+            or convert_info_docx is None
+        ):
+            raise ImportError(
+                "Не установлен PaddleOCR/PP-Structure. Установите зависимости из README."
+            )
+
+        try:
+            self.convert_scanned_pdf_with_structure(pdf_path, docx_path)
+        except Exception as e:
+            if not PADDLE_FALLBACK_TO_OCR:
+                raise
+            logging.warning(
+                f"PP-Structure failed for {pdf_path.name}; falling back to PaddleOCR text OCR: {e}"
+            )
+            self.convert_scanned_pdf_with_paddle_ocr(pdf_path, docx_path)
+
+    def convert_scanned_pdf_with_structure(self, pdf_path, docx_path):
+        """Пытается восстановить структуру документа через PaddleOCR PP-Structure."""
+        pdf_document = None
+        try:
+            if self.paddle_structure_engine is None:
+                logging.info(
+                    f"Initializing PaddleOCR PP-Structure: lang={PADDLE_LANG}, gpu={OCR_GPU}"
+                )
+                self.paddle_structure_engine = PPStructure(
+                    recovery=True,
+                    lang=PADDLE_LANG,
+                    use_gpu=OCR_GPU,
+                    ir_optim=False,
+                    enable_mkldnn=False,
+                    cpu_threads=PADDLE_CPU_THREADS,
+                    show_log=True,
+                )
+
+            pdf_document = fitz.open(pdf_path)
+            page_docx_paths = []
+            temp_folder = self.output_folder / "_paddle_tmp" / pdf_path.stem
+            temp_folder.mkdir(parents=True, exist_ok=True)
+            zoom = OCR_DPI / 72
+            matrix = fitz.Matrix(zoom, zoom)
+
+            for page_num, page in enumerate(pdf_document, 1):
+                logging.info(
+                    f"PaddleOCR page {page_num}/{pdf_document.page_count}: {pdf_path.name}"
+                )
+                pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+                image = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
+                image_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+
+                result = self.paddle_structure_engine(image_bgr)
+                result_for_docx = sorted_layout_boxes(result, image_bgr.shape[1])
+                page_name = f"page_{page_num:04d}"
+                convert_info_docx(
+                    image_bgr,
+                    result_for_docx,
+                    str(temp_folder),
+                    page_name,
+                )
+                page_docx_path = temp_folder / f"{page_name}.docx"
+                page_docx_paths.append(page_docx_path)
+
+                if page_num % 10 == 0:
+                    gc.collect()
+
+            self.merge_docx_pages(page_docx_paths, docx_path)
+        finally:
+            if pdf_document:
+                pdf_document.close()
+
+    def convert_scanned_pdf_with_paddle_ocr(self, pdf_path, docx_path):
+        """Fallback: распознает текст PaddleOCR и собирает редактируемый DOCX по координатам."""
+        if cv2 is None or np is None or PaddleOCR is None:
+            raise ImportError("Не установлен PaddleOCR. Установите зависимости из README.")
+
+        pdf_document = None
+        try:
+            if self.paddle_ocr_engine is None:
+                logging.info(
+                    f"Initializing PaddleOCR text OCR: lang={PADDLE_OCR_LANG}, gpu={OCR_GPU}"
+                )
+                self.paddle_ocr_engine = PaddleOCR(
+                    lang=PADDLE_OCR_LANG,
+                    use_gpu=OCR_GPU,
+                    ir_optim=False,
+                    enable_mkldnn=False,
+                    cpu_threads=PADDLE_CPU_THREADS,
+                    show_log=True,
+                )
+
+            pdf_document = fitz.open(pdf_path)
+            doc = Document()
+            zoom = OCR_DPI / 72
+            matrix = fitz.Matrix(zoom, zoom)
+
+            for page_num, page in enumerate(pdf_document, 1):
+                logging.info(
+                    f"PaddleOCR text page {page_num}/{pdf_document.page_count}: {pdf_path.name}"
+                )
+                pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+                image = Image.frombytes("RGB", [pixmap.width, pixmap.height], pixmap.samples)
+                image_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+
+                result = self.paddle_ocr_engine.ocr(image_bgr, cls=False)
+                layout_lines = self.build_layout_lines_from_paddle_result(
+                    result,
+                    image_bgr.shape[1],
+                )
+
+                if page_num > 1:
+                    doc.add_page_break()
+                self.add_ocr_layout_to_doc(doc, layout_lines, image_bgr.shape[1])
+
+            doc.save(docx_path)
+        finally:
+            if pdf_document:
+                pdf_document.close()
+
+    def build_layout_lines_from_paddle_result(self, result, page_width_px):
+        """Собирает результат PaddleOCR в строки с координатами."""
+        blocks = []
+        page_results = result[0] if result and isinstance(result[0], list) else result
+        for item in page_results or []:
+            if len(item) < 2:
+                continue
+            box, text_info = item[0], item[1]
+            text = self.clean_docx_text(str(text_info[0]).strip())
+            confidence = float(text_info[1]) if len(text_info) > 1 else 1.0
+            if not text or confidence < 0.35:
+                continue
+
+            xs = [point[0] for point in box]
+            ys = [point[1] for point in box]
+            x1, x2 = min(xs), max(xs)
+            y1, y2 = min(ys), max(ys)
+            height = max(y2 - y1, 1)
+            blocks.append({
+                "text": text,
+                "x1": x1,
+                "x2": x2,
+                "y1": y1,
+                "y2": y2,
+                "height": height,
+            })
+
+        if not blocks:
+            return []
+
+        blocks.sort(key=lambda block: (block["y1"], block["x1"]))
+        lines = []
+        for block in blocks:
+            center_y = (block["y1"] + block["y2"]) / 2
+            matched_line = None
+            for line in lines:
+                tolerance = max(line["height"], block["height"]) * 0.65
+                if abs(center_y - line["center_y"]) <= tolerance:
+                    matched_line = line
+                    break
+
+            if matched_line is None:
+                lines.append({
+                    "center_y": center_y,
+                    "height": block["height"],
+                    "blocks": [block],
+                })
+            else:
+                matched_line["blocks"].append(block)
+                matched_line["height"] = max(matched_line["height"], block["height"])
+                matched_line["center_y"] = (
+                    matched_line["center_y"] * (len(matched_line["blocks"]) - 1) + center_y
+                ) / len(matched_line["blocks"])
+
+        lines.sort(key=lambda line: line["center_y"])
+        for line in lines:
+            line["blocks"].sort(key=lambda block: block["x1"])
+            line["x1"] = min(block["x1"] for block in line["blocks"])
+            line["y1"] = min(block["y1"] for block in line["blocks"])
+            line["y2"] = max(block["y2"] for block in line["blocks"])
+            line["height"] = max(block["height"] for block in line["blocks"])
+            line["page_width_px"] = page_width_px
+        return lines
+
+    def clean_docx_text(self, text):
+        """Удаляет символы, которые Word/docx не принимает в XML."""
+        return "".join(
+            char for char in text
+            if char in ("\n", "\t") or ord(char) >= 32
+        )
+
+    def add_ocr_layout_to_doc(self, doc, layout_lines, page_width_px):
+        """Добавляет OCR-текст в DOCX с приближенными размерами и отступами."""
+        if not layout_lines:
+            doc.add_paragraph("[OCR text not detected on this page]")
+            return
+
+        section = doc.sections[-1]
+        usable_width_twips = section.page_width - section.left_margin - section.right_margin
+        previous_y2 = None
+
+        for line in layout_lines:
+            paragraph = doc.add_paragraph()
+            paragraph.paragraph_format.space_after = Pt(0)
+            paragraph.paragraph_format.line_spacing = 1.0
+            paragraph.paragraph_format.left_indent = int(
+                usable_width_twips * (line["x1"] / max(page_width_px, 1))
+            )
+
+            if previous_y2 is not None:
+                gap_px = max(line["y1"] - previous_y2, 0)
+                paragraph.paragraph_format.space_before = Pt(min(gap_px * 72 / OCR_DPI, 36))
+            else:
+                paragraph.paragraph_format.space_before = Pt(0)
+
+            previous_x2 = line["x1"]
+            for index, block in enumerate(line["blocks"]):
+                if index > 0:
+                    gap_ratio = max((block["x1"] - previous_x2) / max(page_width_px, 1), 0)
+                    spaces = max(1, min(int(gap_ratio * 130), 20))
+                    paragraph.add_run(" " * spaces)
+
+                run = paragraph.add_run(block["text"])
+                run.font.name = "Arial"
+                font_size = block["height"] * 72 / OCR_DPI * 0.85
+                run.font.size = Pt(max(7, min(font_size, 22)))
+                previous_x2 = block["x2"]
+
+            previous_y2 = line["y2"]
+
+    def merge_docx_pages(self, page_docx_paths, output_docx_path):
+        """Объединяет DOCX-страницы PaddleOCR в один DOCX."""
+        if not page_docx_paths:
+            raise ValueError("PaddleOCR did not create any DOCX pages")
+
+        if len(page_docx_paths) == 1:
+            shutil.copyfile(page_docx_paths[0], output_docx_path)
+            return
+
+        if Composer is not None:
+            merged_doc = Document(page_docx_paths[0])
+            composer = Composer(merged_doc)
+            for page_docx_path in page_docx_paths[1:]:
+                composer.append(Document(page_docx_path))
+            composer.save(output_docx_path)
+            return
+
+        merged_doc = Document(page_docx_paths[0])
+        for page_docx_path in page_docx_paths[1:]:
+            merged_doc.add_page_break()
+            page_doc = Document(page_docx_path)
+            for element in page_doc.element.body:
+                if element.tag.endswith("sectPr"):
+                    continue
+                merged_doc.element.body.append(element)
+
+        merged_doc.save(output_docx_path)
     
     def convert_single_pdf(self, pdf_path, docx_path):
         """Конвертация одного PDF в редактируемый DOCX"""
         converter = None
         try:
-            if Converter is None:
-                raise ImportError(
-                    "Не установлена библиотека pdf2docx. Установите ее командой: python -m pip install pdf2docx"
-                )
+            use_paddleocr = CONVERT_MODE == "paddleocr" or (
+                CONVERT_MODE == "auto" and self.is_scanned_pdf(pdf_path)
+            )
 
-            converter = Converter(str(pdf_path))
-            converter.convert(str(docx_path), start=0, end=None)
-            
+            if use_paddleocr:
+                logging.info(f"Scanned PDF detected, using PaddleOCR: {pdf_path.name}")
+                self.convert_scanned_pdf_to_docx(pdf_path, docx_path)
+            else:
+                if CONVERT_MODE not in ("auto", "pdf2docx"):
+                    raise ValueError("CONVERT_MODE must be one of: auto, paddleocr, pdf2docx")
+
+                if Converter is None:
+                    raise ImportError(
+                        "Не установлена библиотека pdf2docx. Установите ее командой: python -m pip install pdf2docx"
+                    )
+
+                converter = Converter(str(pdf_path))
+                converter.convert(str(docx_path), start=0, end=None)
+
             # Получаем размер файла для статистики
             file_size = os.path.getsize(pdf_path) / (1024 * 1024)
             

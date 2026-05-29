@@ -3,9 +3,15 @@ __pycache__/
 
 pdf_conversion.log
 conversion_state.json
+pdf_to_convert/conversion_state.json
 pdf_to_convert/*.pdf
 converted_word/
 pdf_backup/
+output/
+inference_results/
+log_output/
+_paddle_tmp/
+**/_paddle_tmp/
 
 .venv/
 venv/
