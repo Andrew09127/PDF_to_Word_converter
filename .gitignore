@@ -2,9 +2,12 @@ __pycache__/
 *.py[cod]
 
 pdf_conversion.log
+docling_conversion.log
+docling_convert.log
 conversion_state.json
 pdf_to_convert/conversion_state.json
 pdf_to_convert/*.pdf
+converted_word_docling/
 converted_word/
 pdf_backup/
 output/
@@ -18,3 +21,4 @@ venv/
 env/
 .idea/
 .vscode/
+
