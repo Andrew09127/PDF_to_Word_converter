@@ -25,7 +25,7 @@ from .config import (
 )
 from .docx_builder import (
     add_label_content_table, add_sidebyside,
-    add_header_row,
+    add_header_row, add_signature_row,
     add_table_from_cells, add_table_from_grid,
     analyse_pages, detect_alignment, init_document, split_label_content,
 )
@@ -223,6 +223,24 @@ class _TextAppendItem:
         return getattr(self._item, name)
 
 
+class _TextTruncateItem:
+    """Возвращает текст элемента ДО позиции end (для разбивки блоков на абзацы)."""
+    __slots__ = ("_item", "_end")
+
+    def __init__(self, item, end: int) -> None:
+        self._item = item
+        self._end  = end
+
+    @property
+    def text(self) -> str:
+        return (getattr(self._item, "text", None) or "")[:self._end]
+
+    def __getattr__(self, name: str):
+        if name in ("_item", "_end"):
+            raise AttributeError(name)
+        return getattr(self._item, name)
+
+
 class _TextSliceItem:
     """Возвращает текст элемента начиная с указанной позиции (для патроним-фикса)."""
     __slots__ = ("_item", "_start")
@@ -260,6 +278,30 @@ class _TextInsertItem:
 
     def __getattr__(self, name: str):
         if name in ("_item", "_pos", "_insertion", "_truncate_at"):
+            raise AttributeError(name)
+        return getattr(self._item, name)
+
+
+class _ForceListItem:
+    """Форсирует рендер text/paragraph как нумерованного list_item (для ПРОСИТ СУД)."""
+    __slots__ = ("_item", "_prefix")
+
+    def __init__(self, item, prefix: str) -> None:
+        self._item   = item
+        self._prefix = prefix
+
+    @property
+    def text(self) -> str:
+        return self._prefix + (getattr(self._item, "text", None) or "")
+
+    @property
+    def label(self):
+        class _L:
+            value = "list_item"
+        return _L()
+
+    def __getattr__(self, name: str):
+        if name in ("_item", "_prefix"):
             raise AttributeError(name)
         return getattr(self._item, name)
 
@@ -551,6 +593,72 @@ def _fix_reading_order(all_items: list) -> tuple[list, set]:
             log.info("fix_order: filled %d gap(s) with unnumbered items on page %d",
                      unnum_used, pg)
         i = j
+
+    # Fix 5: list_item стоит ДО heading/text «ПРОСИТ СУД» — меняем местами
+    # и нумеруем следующие заглавные пункты (1, 2, ...).
+    _PROSIT_RE = re.compile(r'\bПРОСИТ\b', re.IGNORECASE)
+    for i in range(n - 1):
+        if _lbl(i) != "list_item":
+            continue
+        if _lbl(i + 1) not in ("section_header", "text", "title"):
+            continue
+        if _pg(i) != _pg(i + 1):
+            continue
+        if not _PROSIT_RE.search(_txt(i + 1)):
+            continue
+        result[i], result[i + 1] = result[i + 1], result[i]
+        log.info("fix_order: ПРОСИТ_СУД swap %r ↔ %r", _txt(i)[:40], _txt(i + 1)[:40])
+        # Нумеруем следующие заглавные пункты (list_item И text/paragraph)
+        _PROSIT_LBLS = frozenset({"list_item", "text", "paragraph"})
+        num_counter = 1
+        for j in range(i + 1, min(i + 10, n)):
+            cur_lbl = _lbl(j)
+            if cur_lbl not in _PROSIT_LBLS:
+                break
+            t_j = _txt(j)
+            a_j = [c for c in t_j if c.isalpha()]
+            if not a_j or a_j[0].islower():
+                break   # подпункт — стоп
+            if not _NUM_ITEM_RE.match(t_j):
+                if cur_lbl == "list_item":
+                    result[j] = (_TextPrefixItem(result[j][0], f"{num_counter} "), result[j][1])
+                else:
+                    result[j] = (_ForceListItem(result[j][0], f"{num_counter} "), result[j][1])
+                log.info("fix_order: ПРОСИТ_СУД нумерует %d %r (lbl=%s)",
+                         num_counter, t_j[:40], cur_lbl)
+                num_counter += 1
+        break  # один ПРОСИТ СУД на документ
+
+    # Fix 6: разбиваем блоки где OCR объединил несколько абзацев.
+    # Цепочечная разбивка: каждый паттерн применяется к результатам предыдущего.
+    _PARA_SPLIT_RES = [
+        # «...оборотных средств: Срок возврата кредита...» → два абзаца
+        re.compile(r'[;:,.]\s+((?:Срок\s+)?возврата\s+кредита)', re.IGNORECASE),
+        # «...не позднее 10.05.2028. За пользование...» → два абзаца
+        re.compile(r'\.\s+(За\s+пользование)', re.IGNORECASE),
+    ]
+    new_result = []
+    for _item, _level in result:
+        segs = [_item]
+        for _pat in _PARA_SPLIT_RES:
+            new_segs: list = []
+            for _seg in segs:
+                _raw = getattr(_seg, "text", None) or ""
+                _m   = _pat.search(_raw)
+                if _m:
+                    _p1 = _m.start(0) + 1   # конец первого абзаца (включая знак)
+                    _p2 = _m.start(1)        # начало следующего абзаца
+                    new_segs.append(_TextTruncateItem(_seg, _p1))
+                    new_segs.append(_TextSliceItem(_seg, _p2))
+                    log.info("fix_order: split at %r (pos %d/%d)",
+                             _pat.pattern[:35], _p1, _p2)
+                else:
+                    new_segs.append(_seg)
+            segs = new_segs
+        for _seg in segs:
+            new_result.append((_seg, _level))
+    result = new_result
+    n = len(result)
 
     return result, continuation_ids
 
@@ -864,10 +972,16 @@ def build_docx(
     def _page_break(target: int) -> None:
         nonlocal last_content_page
         if last_content_page >= 0 and target > last_content_page:
-            pb = doc.add_page_break()
-            pb.paragraph_format.space_before  = Pt(0)
-            pb.paragraph_format.space_after   = Pt(0)
-            pb.paragraph_format.widow_control = False
+            # Добавляем разрыв страницы в ПОСЛЕДНИЙ параграф (не отдельным пустым),
+            # чтобы избежать «пустой страницы» между секциями документа.
+            if _last_body_para is not None:
+                from docx.enum.text import WD_BREAK
+                _last_body_para.add_run().add_break(WD_BREAK.PAGE)
+            else:
+                pb = doc.add_page_break()
+                pb.paragraph_format.space_before  = Pt(0)
+                pb.paragraph_format.space_after   = Pt(0)
+                pb.paragraph_format.widow_control = False
         last_content_page = target
 
     # Передаём OCR-блоки первой страницы для дополнения шапки
@@ -964,7 +1078,10 @@ def build_docx(
                           if bbox is not None and pw > 0
                           else WD_ALIGN_PARAGRAPH.JUSTIFY)
             if ratio < 0.55 and not is_potential_label \
-                    and _pre_align != WD_ALIGN_PARAGRAPH.CENTER:
+                    and _pre_align != WD_ALIGN_PARAGRAPH.CENTER \
+                    and _pre_align != WD_ALIGN_PARAGRAPH.RIGHT:
+                # RIGHT-выровненные блоки (суммы, госпошлина) — не уменьшаем:
+                # их bbox.h мал из-за однострочного содержимого.
                 font_pt = max(round(BODY_PT * ratio * 2) / 2, 9.0)
 
         # ── Таблицы ──────────────────────────────────────────────────────────
@@ -1201,15 +1318,14 @@ def build_docx(
                 if re.match(r'^(Госпошлин|ПРОСИТ\s+СУД|Приложени)', nxt_text, re.IGNORECASE):
                     log.debug("  label:content стоп (standalone) %r", nxt_text[:30])
                     break
-                nxt_h  = bbox_h(nxt_bbox) if nxt_bbox else 0.0
-                # Базируемся на BODY_PT (11pt), а не font_pt метки (может быть 13pt
-                # для section_header → тогда персданные ДОЛЖНИКА рендерятся 13pt).
+                # Содержимое label:content всегда рендерится BODY_PT — не масштабируем
+                # по высоте bbox (высота блоков персданных меньше медианы,
+                # что даёт ложный результат 9pt для Потапова/адреса).
                 nxt_pt = BODY_PT
-                if nxt_h > 2 and median_h > 0 and nxt_h / median_h < 0.78:
-                    nxt_pt = max(round(BODY_PT * (nxt_h / median_h) * 2) / 2, 9.0)
                 content_items.append({
                     "text": nxt_text, "font_pt": nxt_pt,
-                    "bold": (len(content_items) == 0), "italic": False,
+                    "bold": (len(content_items) == 0),
+                    "italic": (len(content_items) > 0),
                 })
                 log.info("    content[%d] font=%.1fpt bold=%s %r",
                          len(content_items) - 1, nxt_pt,
@@ -1269,16 +1385,18 @@ def build_docx(
                          page_no, font_pt,
                          _align_names.get(alignment, str(alignment)), text[:60])
             elif is_sub_item:
-                # Подпункт (строчная буква): маркированный список с отступом
-                para = doc.add_paragraph(style="List Bullet")
+                # Подпункт (строчная буква): дефис с висячим отступом (ГОСТ)
+                para = doc.add_paragraph()
                 para.alignment                      = WD_ALIGN_PARAGRAPH.JUSTIFY
                 para.paragraph_format.space_before  = Pt(space_before)
                 para.paragraph_format.space_after   = Pt(0)
                 para.paragraph_format.widow_control = False
-                run           = para.add_run(text)
+                para.paragraph_format.left_indent        = Pt(35.4)
+                para.paragraph_format.first_line_indent  = Pt(-17.7)
+                run           = para.add_run("- " + text)
                 run.font.name = FONT_NAME
                 run.font.size = Pt(font_pt)
-                log.info("[стр%d] list_item → List Bullet   font=%.1fpt %r",
+                log.info("[стр%d] list_item → dash   font=%.1fpt %r",
                          page_no, font_pt, text[:60])
             else:
                 para = doc.add_paragraph()
@@ -1299,6 +1417,31 @@ def build_docx(
             _last_body_para = para
             _last_body_text = text
             _seen_text_pages.add(page_no)
+            continue
+
+        # ── Строка подписи: «Представитель по доверенности … / линия / Инициалы» ──
+        _REPR_RE     = re.compile(r'представитель\s+по\s+доверенности', re.IGNORECASE)
+        _INITIALS_RE = re.compile(r'^[А-ЯЁA-Z]\.[А-ЯЁA-Z]\.\S+$')
+        if lbl in ("text", "paragraph") and _REPR_RE.search(text):
+            _right_txt = ""
+            for _j in range(idx + 1, min(idx + 5, len(all_items))):
+                if _j in skip_indices:
+                    continue
+                _nj_item, _ = all_items[_j]
+                _nj_text = postprocess(
+                    (getattr(_nj_item, "text", None) or "").strip()
+                )
+                if _INITIALS_RE.match(_nj_text):
+                    _right_txt = _nj_text
+                    skip_indices.add(_j)
+                    log.info("[стр%d] signature: right=%r", page_no, _nj_text)
+                    break
+            _sig_tw = (pw - 2 * MARGIN_INCH * 72) / 72
+            add_signature_row(doc, text, _right_txt, _sig_tw, space_before=max(space_before, 6.0))
+            _last_body_para = None
+            _last_body_text = text
+            _seen_text_pages.add(page_no)
+            log.info("[стр%d] signature row: %r / %r", page_no, text[:60], _right_txt)
             continue
 
         # ── Обычные параграфы ─────────────────────────────────────────────────

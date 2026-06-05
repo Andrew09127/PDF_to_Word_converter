@@ -287,6 +287,50 @@ def add_header_row(
     doc.add_paragraph()
 
 
+def add_signature_row(
+    doc: Document,
+    left_text: str,
+    right_text: str,
+    text_w_inch: float,
+    space_before: float = 6.0,
+) -> None:
+    """Строка подписи: текст слева | линия подписи | инициалы справа."""
+    tbl = _make_borderless_table(doc, 3)
+    col_l = text_w_inch * 0.52
+    col_m = text_w_inch * 0.28
+    col_r = max(text_w_inch - col_l - col_m, 0.8)
+    for idx, w in enumerate((col_l, col_m, col_r)):
+        _set_cell_width(tbl.cell(0, idx), w)
+
+    # Левая колонка — текст должности
+    p = tbl.cell(0, 0).paragraphs[0]
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    p.paragraph_format.space_before = Pt(space_before)
+    p.paragraph_format.space_after  = Pt(0)
+    run = p.add_run(left_text)
+    run.font.name = FONT_NAME
+    run.font.size = Pt(BODY_PT)
+
+    # Средняя колонка — линия подписи
+    p = tbl.cell(0, 1).paragraphs[0]
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.space_before = Pt(space_before)
+    p.paragraph_format.space_after  = Pt(0)
+    run = p.add_run("_________________")
+    run.font.name = FONT_NAME
+    run.font.size = Pt(BODY_PT)
+
+    # Правая колонка — инициалы
+    p = tbl.cell(0, 2).paragraphs[0]
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    p.paragraph_format.space_before = Pt(space_before)
+    p.paragraph_format.space_after  = Pt(0)
+    if right_text:
+        run = p.add_run(right_text)
+        run.font.name = FONT_NAME
+        run.font.size = Pt(BODY_PT)
+
+
 def split_label_content(text: str) -> tuple[str, str] | None:
     """Возвращает (метка, содержимое) если текст начинается с ALL-CAPS метки."""
     m = LABEL_LINE_RE.match(text.strip())
@@ -321,6 +365,18 @@ def add_label_content_table(
     cl, cr = tbl.cell(0, 0), tbl.cell(0, 1)
     _set_cell_width(cl, col_l)
     _set_cell_width(cr, col_r)
+
+    # Убираем внутренние отступы ячеек (default=0.08in) — контент ближе к метке
+    for _cell in (cl, cr):
+        _tc   = _cell._tc
+        _tcPr = _tc.get_or_add_tcPr()
+        _mar  = OxmlElement("w:tcMar")
+        for _side in ("top", "left", "bottom", "right"):
+            _el = OxmlElement(f"w:{_side}")
+            _el.set(qn("w:w"),    "0")
+            _el.set(qn("w:type"), "dxa")
+            _mar.append(_el)
+        _tcPr.append(_mar)
 
     # Сдвиг таблицы от левого поля (tblInd, единица — twips = 1/1440 дюйма)
     if indent_inch > 0.01:
