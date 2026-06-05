@@ -305,15 +305,32 @@ def add_label_content_table(
     content_items: list[dict],
     text_w_inch: float,
     space_before: float = 0.0,
+    indent_inch: float = 0.0,
+    col_ratio: float | None = None,
 ) -> None:
-    """Безрамочная 2-колоночная строка: метка слева, содержимое справа."""
-    col_l = text_w_inch * LABEL_COL_RATIO
+    """Безрамочная 2-колоночная строка: метка слева, содержимое справа.
+
+    indent_inch — сдвиг таблицы от левого поля (для правоколоночных блоков).
+    col_ratio   — доля ширины для колонки метки (None → LABEL_COL_RATIO).
+    """
+    ratio = col_ratio if col_ratio is not None else LABEL_COL_RATIO
+    col_l = text_w_inch * ratio
     col_r = max(text_w_inch - col_l, 1.5)
 
     tbl    = _make_borderless_table(doc, 2)
     cl, cr = tbl.cell(0, 0), tbl.cell(0, 1)
     _set_cell_width(cl, col_l)
     _set_cell_width(cr, col_r)
+
+    # Сдвиг таблицы от левого поля (tblInd, единица — twips = 1/1440 дюйма)
+    if indent_inch > 0.01:
+        tbl_el = tbl._tbl
+        tbl_pr = tbl_el.find(qn("w:tblPr"))
+        if tbl_pr is not None:
+            tbl_ind = OxmlElement("w:tblInd")
+            tbl_ind.set(qn("w:w"),    str(int(indent_inch * 1440)))
+            tbl_ind.set(qn("w:type"), "dxa")
+            tbl_pr.append(tbl_ind)
 
     p           = cl.paragraphs[0]
     p.alignment                     = WD_ALIGN_PARAGRAPH.LEFT

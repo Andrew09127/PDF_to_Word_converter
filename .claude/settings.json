@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($env:PYTHONIOENCODING = \"utf-8\"; Set-Location \"c:\\\\Диск D\\\\Сбер\\\\Convert\"; & \"c:\\\\Диск D\\\\Сбер\\\\Convert\\\\.venv\\\\Scripts\\\\python.exe\" check_docx.py \"converted_word_docling_test2\\\\Заявление центр инвест — копия.docx\" 2>&1 | Select-Object -First 60)",
+      "PowerShell($env:PYTHONIOENCODING = \"utf-8\"; Set-Location \"c:\\\\Диск D\\\\Сбер\\\\Convert\"; & \"c:\\\\Диск D\\\\Сбер\\\\Convert\\\\.venv\\\\Scripts\\\\python.exe\" check_docx.py)",
+      "Read(//c/��� D/����/Convert/**)",
+      "PowerShell($env:PYTHONIOENCODING = \"utf-8\"; Set-Location \"c:\\\\Диск D\\\\Сбер\\\\Convert\"; New-Item -ItemType Directory -Force \"c:\\\\Диск D\\\\Сбер\\\\Convert\\\\test_out\" | Out-Null; & \"c:\\\\Диск D\\\\Сбер\\\\Convert\\\\.venv\\\\Scripts\\\\python.exe\" convert_docling_dev.py \"pdf_backup\\\\Заявление центр инвест — копия.pdf\" --output \"c:\\\\Диск D\\\\Сбер\\\\Convert\\\\test_out\" 2>&1 | Select-Object -Last 3)",
+      "PowerShell($env:PYTHONIOENCODING = \"utf-8\"; Set-Location \"c:\\\\Диск D\\\\Сбер\\\\Convert\"; & \"c:\\\\Диск D\\\\Сбер\\\\Convert\\\\.venv\\\\Scripts\\\\python.exe\" -c \"import docling_dev.converter; import docling_dev.ocr_fixes; print\\('OK'\\)\")"
+    ]
+  }
+}

@@ -22,13 +22,17 @@ import sys
 from pathlib import Path
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s  %(levelname)s  %(message)s",
     handlers=[
         logging.FileHandler("docling_convert.log", encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
+# Подавляем DEBUG от внешних библиотек — только наш код
+for _lib in ("docling", "httpx", "urllib3", "PIL", "torch", "easyocr",
+             "transformers", "httpcore", "hpack"):
+    logging.getLogger(_lib).setLevel(logging.WARNING)
 
 _HERE = Path(__file__).parent
 if str(_HERE) not in sys.path:
