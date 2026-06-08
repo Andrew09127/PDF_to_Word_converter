@@ -575,8 +575,17 @@ def _fix_reading_order(all_items: list) -> tuple[list, set]:
                     unnum_used += 1
             final_order.append(k)
             prev_num = num
-        # Оставшиеся ненумерованные — в конец
-        final_order.extend(unnumbered[unnum_used:])
+        # Оставшиеся ненумерованные — автонумерация продолжением
+        _remaining_unnum = unnumbered[unnum_used:]
+        if _remaining_unnum and numbered:
+            _next_auto = max(n for n, _ in numbered) + 1
+            for _gap_k in _remaining_unnum:
+                final_order.append(_gap_k)
+                gap_prefixes[_gap_k] = f"{_next_auto} "
+                log.info("fix_order: автонумер %d %r", _next_auto, txts[_gap_k][:60])
+                _next_auto += 1
+        else:
+            final_order.extend(_remaining_unnum)
 
         reordered = [
             (_TextPrefixItem(result[i + k][0], gap_prefixes[k]), result[i + k][1])
@@ -670,6 +679,24 @@ _LETTERHEAD_STOP_RE = re.compile(
     r"кредитор|должник|заявлени[ея]|исковое|госпошлин\w*|"
     r"арбитражн\w*\s+управляющ|арбитражн\w*\s+суд|по\s+делу"
     r")\b",
+    re.IGNORECASE,
+)
+
+
+# ── Паттерны для build_docx (компилируем один раз) ───────────────────────────
+
+# Детектор «Госпошлина» для склейки соседнего bbox суммы
+_GOSPOSHLINA_RE = re.compile(r'^Госпошлин', re.IGNORECASE)
+
+# Детекторы строки подписи
+_REPR_RE     = re.compile(r'представитель\s+по\s+доверенности', re.IGNORECASE)
+_INITIALS_RE = re.compile(r'^[А-ЯЁA-Z]\.[А-ЯЁA-Z]\.\S+')
+
+# Слова-стартеры новых абзацев — блокируют ложное _is_justify_cont слияние
+_PARA_STARTERS_RE = re.compile(
+    r'^(возврата\b|срок\s+возврата\b|за\s+пользование\b|'
+    r'оценочная\b|расчет\b|включить\b|признать\b|'
+    r'в\s+соответствии\s+с\b|согласно\b|исполнение\b)',
     re.IGNORECASE,
 )
 
@@ -1064,6 +1091,14 @@ def build_docx(
         item_h    = bbox_h(bbox) if bbox is not None else 0.0
 
         font_pt = LABEL_PT.get(lbl, BODY_PT)
+        # section_header в правой части первой страницы (блок сторон: «Арбитражный суд»,
+        # «по делу №») — используем размер тела (11pt), не 13pt.
+        # ЗАЯВЛЕНИЕ (x0=270.7 < pw*0.48=285.6) и подзаголовки остаются 13pt.
+        if lbl == "section_header" and page_no == first_page_no and bbox is not None:
+            _sh_x0 = float(getattr(bbox, "l", 0))
+            if _sh_x0 > pw * 0.48:
+                font_pt = BODY_PT
+
         if lbl in ("paragraph", "text") and item_h > 2 and median_h > 0:
             ratio = item_h / median_h
             # Масштабируем только если явно меньше 0.55 медианы.
@@ -1118,7 +1153,10 @@ def build_docx(
                 if bbox is not None:
                     bbox_w_pt     = float(getattr(bbox, "r", 0)) - float(getattr(bbox, "l", 0))
                     target_w_inch = min(bbox_w_pt / 72, text_w_inch) if bbox_w_pt > 10 else text_w_inch
-                    img_align     = detect_alignment(bbox, pw)
+                    # На первой странице — выравниваем по bbox; на остальных — центр
+                    img_align = (detect_alignment(bbox, pw)
+                                 if page_no == first_page_no
+                                 else WD_ALIGN_PARAGRAPH.CENTER)
                 else:
                     target_w_inch = text_w_inch
                     img_align     = WD_ALIGN_PARAGRAPH.CENTER
@@ -1243,7 +1281,7 @@ def build_docx(
 
         _alpha       = [c for c in text if c.isalpha()]
         _is_all_caps = bool(_alpha) and all(c.isupper() for c in _alpha) and len(text.strip()) <= 60
-        bold   = lbl in ("title", "section_header") or _is_all_caps
+        bold   = lbl in ("title", "section_header") or _is_all_caps or _gosposhlina_bold
         italic = lbl in ("caption", "footnote")
 
         # Предупреждение при нетипичном размере шрифта
@@ -1263,19 +1301,68 @@ def build_docx(
 
         _page_break(page_no)
 
+        # ── Госпошлина: два соседних bbox на одной строке → объединяем ────────
+        # «Госпошлина» (l=298, r=370) и «37 554 руб.» (l=377, r=438) — coplanar items.
+        _gosposhlina_bold = False
+        if lbl in ("text", "paragraph") and _GOSPOSHLINA_RE.match(text):
+            for _gj in range(idx + 1, min(idx + 3, len(all_items))):
+                if _gj in skip_indices:
+                    continue
+                _gj_item, _ = all_items[_gj]
+                _gj_prov = getattr(_gj_item, "prov", None) or []
+                if not _gj_prov or int(getattr(_gj_prov[0], "page_no", -1)) != page_no:
+                    break
+                _gj_bbox = getattr(_gj_prov[0], "bbox", None)
+                if _gj_bbox and bbox and coplanar(bbox, _gj_bbox, tolerance=20.0):
+                    _gj_text = postprocess(
+                        (getattr(_gj_item, "text", None) or "").strip()
+                    )
+                    if _gj_text:
+                        text = f"{text}: {_gj_text}"
+                        skip_indices.add(_gj)
+                        _gosposhlina_bold = True
+                        alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                        log.info("[стр%d] Госпошлина merge: %r", page_no, text)
+                    break
+
         # ── Блоки МЕТКА:содержимое ────────────────────────────────────────────
         _item_x0 = float(getattr(bbox, "l", 0)) if bbox is not None else 0.0
         lc = split_label_content(text) if _item_x0 <= pw * LABEL_MARGIN_THRESHOLD else None
         if lc is not None:
-            # Вычисляем отступ для правоколоночных блоков (КРЕДИТОР:, ДОЛЖНИК: и т.п.)
-            # Они располагаются в правой части страницы (x0 > 30% ширины) и должны
-            # начинаться там же в Word, а не от левого поля.
-            _full_tw     = (pw - 2 * MARGIN_INCH * 72) / 72
-            _lc_indent   = 0.0
+            _full_tw      = (pw - 2 * MARGIN_INCH * 72) / 72
+            _lc_indent    = 0.0
             _lc_col_ratio = None
-            if alignment == WD_ALIGN_PARAGRAPH.RIGHT and _item_x0 > pw * 0.30:
-                _lc_indent    = max((_item_x0 - MARGIN_INCH * 72) / 72, 0.0)
-                _lc_col_ratio = 0.22   # компактная колонка для коротких меток
+
+            # Определяем ширину колонки метки динамически по x0 первого контент-блока.
+            # Это выравнивает КРЕДИТОР:/ДОЛЖНИК:/АРБИТРАЖНЫЙ УПРАВЛЯЮЩИЙ в одну колонку:
+            # все три имеют контент около x=298pt — col_ratio вычисляется одинаково.
+            _cont_x0 = None
+            for _pk in range(idx + 1, min(idx + 4, len(all_items))):
+                if _pk in skip_indices:
+                    continue
+                _pk_item, _ = all_items[_pk]
+                _pk_lbl = _label_str(_pk_item)
+                if _pk_lbl in (SKIP_LABELS | {"table", "picture", "figure", "image",
+                                               "list_item", "section_header", "title"}):
+                    break
+                _pk_prov = getattr(_pk_item, "prov", None) or []
+                if not _pk_prov or int(getattr(_pk_prov[0], "page_no", -1)) != page_no:
+                    break
+                _pk_bbox = getattr(_pk_prov[0], "bbox", None)
+                if _pk_bbox is not None:
+                    _cont_x0 = float(getattr(_pk_bbox, "l", 0))
+                break
+
+            _lm_pt = MARGIN_INCH * 72
+            if _cont_x0 is not None and _cont_x0 > pw * 0.42:
+                # Таблица начинается от левого поля (indent=0).
+                # Ширина колонки метки = расстояние от левого поля до x0 контента.
+                # КРЕДИТОР/ДОЛЖНИК/АРБИТРАЖНЫЙ УПРАВЛЯЮЩИЙ — контент выравнивается
+                # по одной вертикали (~296-298pt), метки начинаются с левого поля.
+                _lc_indent    = 0.0
+                _label_w_in   = max((_cont_x0 - _lm_pt) / 72, 0.5)
+                _lc_col_ratio = min(_label_w_in / _full_tw, 0.65)
+
             text_w_inch = _full_tw - _lc_indent
 
             log.info("  → label:content  label=%r  content=%r  x0=%.1fpt (thr=%.1fpt) "
@@ -1324,8 +1411,8 @@ def build_docx(
                 nxt_pt = BODY_PT
                 content_items.append({
                     "text": nxt_text, "font_pt": nxt_pt,
-                    "bold": (len(content_items) == 0),
-                    "italic": (len(content_items) > 0),
+                    "bold":   (len(content_items) == 0),
+                    "italic": False,
                 })
                 log.info("    content[%d] font=%.1fpt bold=%s %r",
                          len(content_items) - 1, nxt_pt,
@@ -1340,11 +1427,13 @@ def build_docx(
 
         # ── Заголовки ─────────────────────────────────────────────────────────
         if lbl in LABEL_HEADING:
-            # Подзаголовки (начинаются со строчной буквы) — центрируем.
-            # «о включении в реестр» / «требований кредиторов должника» стоят
-            # под «ЗАЯВЛЕНИЕ» и должны быть по центру, как в оригинале.
+            # Подзаголовки со строчной буквы центрируем ТОЛЬКО если блок
+            # расположен в левой половине страницы (x0 < 48% ширины).
+            # «по делу № А53-3675/2025» — x0≈298pt > 285pt — остаётся RIGHT.
+            # «о включении в реестр»   — x0≈154pt < 285pt — получает CENTER.
             alpha = [c for c in text if c.isalpha()]
-            if alpha and alpha[0].islower():
+            _h_x0 = float(getattr(bbox, "l", 0)) if bbox is not None else 0.0
+            if alpha and alpha[0].islower() and _h_x0 < pw * 0.48:
                 alignment = WD_ALIGN_PARAGRAPH.CENTER
             para = doc.add_heading("", level=min(LABEL_HEADING[lbl], 9))
             para.alignment                       = alignment
@@ -1353,6 +1442,14 @@ def build_docx(
             para.paragraph_format.widow_control  = False
             para.paragraph_format.keep_with_next = False
             para.paragraph_format.keep_together  = False
+            # Heading-блоки в правой части страницы (x0 > 42% ширины) получают
+            # left_indent чтобы совпасть с правой колонкой label:content таблиц.
+            _h_lm = page_left_min.get(page_no, 0.0)
+            if alignment == WD_ALIGN_PARAGRAPH.RIGHT and _h_x0 > pw * 0.42:
+                _h_indent_in = max((_h_x0 - _h_lm) / 72, 0.0)
+                para.paragraph_format.left_indent = Pt(_h_indent_in * 72)
+            else:
+                para.paragraph_format.left_indent = Pt(0)
             run                = para.add_run(text)
             run.font.name      = FONT_NAME
             run.font.size      = Pt(font_pt)
@@ -1365,34 +1462,40 @@ def build_docx(
         # Подпункты (первая буква строчная) → стиль Word «List Bullet» + отступ
         # Остальные list_item               → абзац с красной строкой (ГОСТ 7.32)
         if lbl == "list_item":
-            if alignment == WD_ALIGN_PARAGRAPH.RIGHT:
+            if alignment in (WD_ALIGN_PARAGRAPH.RIGHT, WD_ALIGN_PARAGRAPH.CENTER):
                 alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             _li_alpha  = [c for c in text if c.isalpha()]
             num_match  = _NUM_ITEM_RE.match(text)
             is_sub_item = bool(_li_alpha) and _li_alpha[0].islower() and not num_match
 
             if num_match:
+                num_str   = num_match.group(1).strip() + "."
                 text_body = text[num_match.end():]
-                para = doc.add_paragraph(style="List Number")
-                para.alignment                      = alignment
-                para.paragraph_format.space_before  = Pt(space_before)
-                para.paragraph_format.space_after   = Pt(0)
-                para.paragraph_format.widow_control = False
-                run           = para.add_run(text_body)
+                para = doc.add_paragraph()
+                para.alignment                       = alignment
+                para.paragraph_format.space_before   = Pt(space_before)
+                para.paragraph_format.space_after    = Pt(0)
+                para.paragraph_format.widow_control  = False
+                # Красная строка: «2. текст» на первой строке с отступом,
+                # продолжение — от левого края (по просьбе пользователя).
+                para.paragraph_format.left_indent        = Pt(0)
+                para.paragraph_format.first_line_indent  = Pt(35.4)
+                run           = para.add_run(f"{num_str} {text_body}")
                 run.font.name = FONT_NAME
                 run.font.size = Pt(font_pt)
-                log.info("[стр%d] list_item → List Number  font=%.1fpt align=%-8s %r",
+                log.info("[стр%d] list_item → numbered  font=%.1fpt align=%-8s %r",
                          page_no, font_pt,
                          _align_names.get(alignment, str(alignment)), text[:60])
             elif is_sub_item:
-                # Подпункт (строчная буква): дефис с висячим отступом (ГОСТ)
+                # Подпункт: та же красная строка что у нумерованных (35.4pt),
+                # продолжение — от левого края. Дефис и текст на одной строке.
                 para = doc.add_paragraph()
                 para.alignment                      = WD_ALIGN_PARAGRAPH.JUSTIFY
                 para.paragraph_format.space_before  = Pt(space_before)
                 para.paragraph_format.space_after   = Pt(0)
                 para.paragraph_format.widow_control = False
-                para.paragraph_format.left_indent        = Pt(35.4)
-                para.paragraph_format.first_line_indent  = Pt(-17.7)
+                para.paragraph_format.left_indent        = Pt(0)
+                para.paragraph_format.first_line_indent  = Pt(35.4)
                 run           = para.add_run("- " + text)
                 run.font.name = FONT_NAME
                 run.font.size = Pt(font_pt)
@@ -1419,30 +1522,49 @@ def build_docx(
             _seen_text_pages.add(page_no)
             continue
 
-        # ── Строка подписи: «Представитель по доверенности … / линия / Инициалы» ──
-        _REPR_RE     = re.compile(r'представитель\s+по\s+доверенности', re.IGNORECASE)
-        _INITIALS_RE = re.compile(r'^[А-ЯЁA-Z]\.[А-ЯЁA-Z]\.\S+$')
+        # ── Строка подписи: «Представитель по доверенности … / картинка / Инициалы» ──
         if lbl in ("text", "paragraph") and _REPR_RE.search(text):
             _right_txt = ""
-            for _j in range(idx + 1, min(idx + 5, len(all_items))):
+            _sig_pic   = None
+            # Просматриваем ближайшие 10 элементов: ищем картинку подписи
+            # И все вхождения инициалов (могут дублироваться OCR).
+            for _j in range(idx + 1, min(idx + 10, len(all_items))):
                 if _j in skip_indices:
                     continue
                 _nj_item, _ = all_items[_j]
+                _nj_lbl  = _label_str(_nj_item)
+                _nj_prov = getattr(_nj_item, "prov", None) or []
+                _nj_pg   = int(getattr(_nj_prov[0], "page_no", -1)) if _nj_prov else -1
+                if _nj_pg != page_no:
+                    break
+                if _nj_lbl in ("picture", "figure", "image"):
+                    if _sig_pic is None:
+                        try:
+                            _sig_pic = _nj_item.get_image(dl_doc)
+                        except Exception:
+                            pass
+                    skip_indices.add(_j)
+                    continue
                 _nj_text = postprocess(
                     (getattr(_nj_item, "text", None) or "").strip()
                 )
                 if _INITIALS_RE.match(_nj_text):
-                    _right_txt = _nj_text
-                    skip_indices.add(_j)
-                    log.info("[стр%d] signature: right=%r", page_no, _nj_text)
-                    break
-            _sig_tw = (pw - 2 * MARGIN_INCH * 72) / 72
-            add_signature_row(doc, text, _right_txt, _sig_tw, space_before=max(space_before, 6.0))
-            _last_body_para = None
-            _last_body_text = text
-            _seen_text_pages.add(page_no)
-            log.info("[стр%d] signature row: %r / %r", page_no, text[:60], _right_txt)
-            continue
+                    if not _right_txt:
+                        _right_txt = _nj_text
+                    skip_indices.add(_j)   # скипаем ВСЕ дубли инициалов
+                    log.info("[стр%d] signature initials skip %d: %r", page_no, _j, _nj_text)
+            # Рендерим только если нашли картинку ИЛИ инициалы
+            if _right_txt or _sig_pic is not None:
+                _sig_tw = (pw - 2 * MARGIN_INCH * 72) / 72
+                add_signature_row(doc, text, _right_txt, _sig_tw,
+                                  space_before=max(space_before, 6.0),
+                                  sig_image=_sig_pic)
+                _last_body_para = None
+                _last_body_text = text
+                _seen_text_pages.add(page_no)
+                log.info("[стр%d] signature row: pic=%s right=%r",
+                         page_no, _sig_pic is not None, _right_txt)
+                continue
 
         # ── Обычные параграфы ─────────────────────────────────────────────────
 
@@ -1474,10 +1596,12 @@ def build_docx(
         # Ограничения делают правило безопасным:
         #   • предыдущий блок ДОЛЖЕН заканчиваться на ':'
         #   • текущий блок НЕ является датой DD.MM.YYYY (дата всегда начинает новый абзац)
+        #   • текущий блок НЕ начинается с известного открывающего слова нового абзаца
         _is_justify_cont = (
             _is_lowercase_start and
             not bool(_CONT_RE.match(text)) and
             not bool(_DATE_START_RE.match(text)) and
+            not bool(_PARA_STARTERS_RE.match(text)) and
             lbl in ("text", "paragraph") and
             alignment == WD_ALIGN_PARAGRAPH.JUSTIFY and
             _prev_unfinished and
@@ -1527,6 +1651,12 @@ def build_docx(
             if _is_red_line:
                 para.paragraph_format.first_line_indent = Pt(35.4)
                 para.paragraph_format.left_indent       = Pt(0)
+            elif _gosposhlina_bold and bbox is not None and alignment == WD_ALIGN_PARAGRAPH.RIGHT:
+                # Госпошлина: left_indent совпадает с left_indent heading-блоков той же страницы
+                _gp_lm = page_left_min.get(page_no, 0.0)
+                _gp_x0 = float(getattr(bbox, "l", 0))
+                para.paragraph_format.first_line_indent = Pt(0)
+                para.paragraph_format.left_indent       = Pt(max(_gp_x0 - _gp_lm, 0.0))
             else:
                 para.paragraph_format.first_line_indent = Pt(0)
                 para.paragraph_format.left_indent       = Pt(indent_pt)

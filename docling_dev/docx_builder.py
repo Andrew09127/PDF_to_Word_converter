@@ -49,9 +49,26 @@ def init_document() -> Document:
         h.font.name      = FONT_NAME
         h.font.color.rgb = RGBColor(0, 0, 0)
         h.font.bold      = True
-        h.paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
-        h.paragraph_format.keep_with_next    = False
-        h.paragraph_format.keep_together     = False
+        h.paragraph_format.line_spacing_rule  = WD_LINE_SPACING.SINGLE
+        h.paragraph_format.keep_with_next     = False
+        h.paragraph_format.keep_together      = False
+        # Сбрасываем отступы заголовков чтобы RIGHT/CENTER-выравнивание
+        # не сдвигалось из-за дефолтного left_indent Word (Heading 2 ≈ 0.25in)
+        h.paragraph_format.left_indent        = Pt(0)
+        h.paragraph_format.first_line_indent  = Pt(0)
+
+    # Нумерованный список: явный висячий отступ совпадает с "-" подпунктами.
+    # number at 17.7pt, text at 35.4pt — одинаково для "1." и "–" items.
+    try:
+        ln = doc.styles["List Number"]
+        ln.font.name = FONT_NAME
+        ln.font.size = Pt(BODY_PT)
+        ln.paragraph_format.left_indent         = Pt(35.4)
+        ln.paragraph_format.first_line_indent   = Pt(-17.7)
+        ln.paragraph_format.line_spacing_rule   = WD_LINE_SPACING.SINGLE
+        ln.paragraph_format.widow_control       = False
+    except KeyError:
+        pass
 
     return doc
 
@@ -254,6 +271,17 @@ def add_header_row(
             used_width += col_w
         _set_cell_width(cell, col_w)
 
+        # Убираем внутренние поля ячейки чтобы текст занимал максимальную ширину
+        _tc = cell._tc
+        _tcPr = _tc.get_or_add_tcPr()
+        _mar = OxmlElement("w:tcMar")
+        for _side in ("top", "left", "bottom", "right"):
+            _el = OxmlElement(f"w:{_side}")
+            _el.set(qn("w:w"), "0")
+            _el.set(qn("w:type"), "dxa")
+            _mar.append(_el)
+        _tcPr.append(_mar)
+
         para = cell.paragraphs[0]
         para.alignment = cell_data.get("alignment", WD_ALIGN_PARAGRAPH.LEFT)
         para.paragraph_format.space_before = Pt(0)
@@ -293,16 +321,34 @@ def add_signature_row(
     right_text: str,
     text_w_inch: float,
     space_before: float = 6.0,
+    sig_image=None,
 ) -> None:
-    """Строка подписи: текст слева | линия подписи | инициалы справа."""
-    tbl = _make_borderless_table(doc, 3)
-    col_l = text_w_inch * 0.52
-    col_m = text_w_inch * 0.28
-    col_r = max(text_w_inch - col_l - col_m, 0.8)
-    for idx, w in enumerate((col_l, col_m, col_r)):
-        _set_cell_width(tbl.cell(0, idx), w)
+    """Строка подписи: текст (bold) | картинка подписи | инициалы (bold)."""
+    n_cols = 3 if (sig_image is not None or right_text) else 2
+    tbl = _make_borderless_table(doc, n_cols)
 
-    # Левая колонка — текст должности
+    if n_cols == 3:
+        col_l = text_w_inch * 0.38
+        col_m = text_w_inch * 0.38
+        col_r = max(text_w_inch - col_l - col_m, 0.5)
+        for i, w in enumerate((col_l, col_m, col_r)):
+            _set_cell_width(tbl.cell(0, i), w)
+    else:
+        col_l = text_w_inch * 0.70
+        col_r = max(text_w_inch - col_l, 0.5)
+        for i, w in enumerate((col_l, col_r)):
+            _set_cell_width(tbl.cell(0, i), w)
+
+    def _vcenter(cell) -> None:
+        """Вертикальное выравнивание по центру ячейки."""
+        tc   = cell._tc
+        tcPr = tc.get_or_add_tcPr()
+        va   = OxmlElement("w:vAlign")
+        va.set(qn("w:val"), "center")
+        tcPr.append(va)
+
+    # Левая колонка — жирный текст должности
+    _vcenter(tbl.cell(0, 0))
     p = tbl.cell(0, 0).paragraphs[0]
     p.alignment = WD_ALIGN_PARAGRAPH.LEFT
     p.paragraph_format.space_before = Pt(space_before)
@@ -310,25 +356,42 @@ def add_signature_row(
     run = p.add_run(left_text)
     run.font.name = FONT_NAME
     run.font.size = Pt(BODY_PT)
+    run.bold      = True
 
-    # Средняя колонка — линия подписи
-    p = tbl.cell(0, 1).paragraphs[0]
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.space_before = Pt(space_before)
-    p.paragraph_format.space_after  = Pt(0)
-    run = p.add_run("_________________")
-    run.font.name = FONT_NAME
-    run.font.size = Pt(BODY_PT)
+    if n_cols == 3:
+        # Средняя колонка — картинка подписи (если есть)
+        _vcenter(tbl.cell(0, 1))
+        p = tbl.cell(0, 1).paragraphs[0]
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.paragraph_format.space_before = Pt(space_before)
+        p.paragraph_format.space_after  = Pt(0)
+        if sig_image is not None:
+            buf = BytesIO()
+            sig_image.save(buf, format="PNG")
+            buf.seek(0)
+            iw, ih = sig_image.size
+            aspect = ih / iw if iw > 0 else 1.0
+            target_w = min(col_m - 0.1, 1.5)
+            if target_w * aspect > 1.2:
+                target_w = 1.2 / aspect
+            p.add_run().add_picture(buf, width=Inches(max(target_w, 0.3)))
 
-    # Правая колонка — инициалы
-    p = tbl.cell(0, 2).paragraphs[0]
-    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        # Правая колонка — жирные инициалы, прижаты к правому краю
+        _vcenter(tbl.cell(0, 2))
+        p_right = tbl.cell(0, 2).paragraphs[0]
+    else:
+        _vcenter(tbl.cell(0, 1))
+        p_right = tbl.cell(0, 1).paragraphs[0]
+    p = p_right
+
+    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT  # Л.В.Халиль к правому краю
     p.paragraph_format.space_before = Pt(space_before)
     p.paragraph_format.space_after  = Pt(0)
     if right_text:
         run = p.add_run(right_text)
         run.font.name = FONT_NAME
         run.font.size = Pt(BODY_PT)
+        run.bold      = True
 
 
 def split_label_content(text: str) -> tuple[str, str] | None:
