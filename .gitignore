@@ -21,4 +21,5 @@ venv/
 env/
 .idea/
 .vscode/
+.claude/
 
