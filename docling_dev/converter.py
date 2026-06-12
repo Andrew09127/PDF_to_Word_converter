@@ -24,7 +24,7 @@ from .config import (
     MARGIN_INCH, SKIP_LABELS,
 )
 from .docx_builder import (
-    add_label_content_table, add_sidebyside,
+    add_label_content_table, add_sidebyside, add_es_stamp,
     add_header_row, add_signature_row,
     add_table_from_cells, add_table_from_grid,
     analyse_pages, detect_alignment, init_document, split_label_content,
@@ -449,6 +449,26 @@ def _fix_reading_order(all_items: list) -> tuple[list, set]:
             log.debug("fix_order: date-start пропуск (предш. заканчивается на терминатор) %r", prev[-20:])
             continue
 
+        # Предыдущий блок — предложение-ВВЕДЕНИЕ списка: «…подтверждается
+        # нижеследующим», «…в следующем размере:», «…следующим образом:».
+        # Блок с датой и есть это «последующее» содержимое — он должен идти
+        # ПОСЛЕ введения, поэтому НЕ переставляем. Двоеточие необязательно:
+        # OCR часто его теряет («подтверждается нижеследующим» без «:»).
+        if re.search(r'(следующ\w*|образом)\s*[:.]?\s*$', prev, re.IGNORECASE):
+            log.debug("fix_order: date-start пропуск (введение списка) %r", prev[-40:])
+            continue
+
+        # Предыдущий блок — короткое ALL-CAPS ФИО (2-4 слова, только буквы и пробелы).
+        # «ХЛИЯН ЕЛЕНА ОГАНОВНА» — это значение поля «Должник:», а не незаконченная фраза.
+        _prev_words = prev.split()
+        _prev_alpha = [c for c in prev if c.isalpha()]
+        if (2 <= len(_prev_words) <= 4
+                and _prev_alpha
+                and all(c.isupper() for c in _prev_alpha)
+                and all(c.isalpha() or c.isspace() or c in '-' for c in prev)):
+            log.debug("fix_order: date-start пропуск (ALL-CAPS ФИО) %r", prev[:50])
+            continue
+
         log.debug("fix_order: date-start кандидат: prev=%r curr=%r (prev_i=%d, i=%d)",
                   prev[:50], curr[:50], prev_i, i)
 
@@ -682,11 +702,410 @@ _LETTERHEAD_STOP_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Стоп-паттерны шапки: блоки ниже этой точки — не шапка
+_HEADER_BODY_START_RE = re.compile(
+    r"^\s*(заявлени[ея]|исковое\s+заявлени[ея]|требовани[ея]|"
+    r"ходатайство|возражени[ея]|отзыв)\b"
+    r"|^\s*(должник|финансовый\s+управляющий)\s*:",
+    re.IGNORECASE,
+)
+
+
+def _render_native_two_column_header(
+    doc,
+    all_items: list,
+    page_sizes: dict[int, tuple[float, float]],
+    pdf_native: bool,
+    page_medians: dict,
+    page_left_min: dict,
+    already_skipped: set | None = None,
+    prepend_right_blocks: list | None = None,
+    logo_data: tuple | None = None,  # (pil_img, pic_w_pt, img_w_inch) от letterhead
+) -> set[int]:
+    """
+    Рендер двухколоночной шапки для нативных PDF (без логотипа).
+
+    Шапка включает все элементы первой страницы до первого заголовка
+    типа «ЗАЯВЛЕНИЕ» / «ПРОСИТ СУД» / «ТРЕБОВАНИЕ» (которые переходят
+    на следующую страницу или стоят в середине страницы как section_header).
+
+    Возвращает set индексов элементов которые были включены в шапку.
+    """
+    first_page = min(page_sizes.keys()) if page_sizes else 1
+    pw, ph = page_sizes.get(first_page, (595.0, 842.0))
+    if pw <= 0 or ph <= 0:
+        return set()
+
+    _already_skipped = already_skipped or set()
+
+    # Собираем все элементы первой страницы до стоп-маркера
+    header_items: list[tuple[int, object, object, float, float]] = []
+    for idx, (item, level) in enumerate(all_items):
+        if idx in _already_skipped:
+            continue
+        lbl = _label_str(item)
+        if not lbl or lbl in SKIP_LABELS:
+            continue
+        if lbl in ("table", "picture", "figure", "image"):
+            continue
+        bbox, page_no = _item_bbox_page(item, first_page)
+        if page_no != first_page or bbox is None:
+            continue
+        text = postprocess((getattr(item, "text", None) or "").strip())
+        if not text:
+            continue
+        # Стоп: section_header / title = начало тела документа
+        if lbl in ("section_header", "title"):
+            break
+        # Стоп: явный маркер начала тела
+        if _HEADER_BODY_START_RE.match(text):
+            break
+        top, _ = _bbox_top_bottom(bbox, ph, pdf_native)
+        x0 = float(getattr(bbox, "l", 0))
+        header_items.append((idx, item, level, x0, top))
+
+    if len(header_items) < 2:
+        return set()
+
+    # Вертикальный фильтр: блоки с top_nat > 0.68 (нижняя треть страницы)
+    # не являются частью шапки — это Место/Дата рождения, которые word_order
+    # ставит раньше стоп-маркера «Должник:», хотя физически ниже него.
+    _max_top_nat = 0.68
+    header_items = [(idx, item, lvl, x0, top)
+                    for idx, item, lvl, x0, top in header_items
+                    if top <= ph * _max_top_nat]
+
+    if len(header_items) < 2:
+        return set()
+
+    # Определяем границу колонок через k-means с k=2.
+    # Разбиваем все x0 на два кластера и берём точку между ними как границу.
+    x0_raw = sorted(x0 for _, _, _, x0, _ in header_items)
+    if len(x0_raw) < 2:
+        return set()
+    # Инициализация: левый центр = медиана нижней половины, правый = верхней
+    mid = len(x0_raw) // 2
+    c_left  = sum(x0_raw[:mid]) / mid
+    c_right = sum(x0_raw[mid:]) / max(len(x0_raw) - mid, 1)
+    for _ in range(10):  # итерации k-means
+        left_pts  = [x for x in x0_raw if abs(x - c_left) <= abs(x - c_right)]
+        right_pts = [x for x in x0_raw if abs(x - c_right) < abs(x - c_left)]
+        if not left_pts or not right_pts:
+            break
+        c_left  = sum(left_pts)  / len(left_pts)
+        c_right = sum(right_pts) / len(right_pts)
+    col_boundary = (c_left + c_right) / 2.0
+    separation   = c_right - c_left
+    log.debug("native_header: c_left=%.0f c_right=%.0f separation=%.0f boundary=%.0f",
+              c_left, c_right, separation, col_boundary)
+    # Колонки должны быть достаточно разделены (> 10% ширины страницы)
+    if separation < pw * 0.10 or col_boundary <= 0:
+        log.info("native_header: колонки не разделены (separation=%.0f < %.0f) — пропуск",
+                 separation, pw * 0.10)
+        return set()
+
+    left_items  = [(idx, item, lvl, x0, top)
+                   for idx, item, lvl, x0, top in header_items if x0 < col_boundary]
+    right_items = [(idx, item, lvl, x0, top)
+                   for idx, item, lvl, x0, top in header_items if x0 >= col_boundary]
+
+    # Если нет разделения — не рендерим как двухколоночную
+    if not left_items or not right_items:
+        log.info("native_header: нет двух колонок (left=%d right=%d) — пропуск",
+                 len(left_items), len(right_items))
+        return set()
+
+    log.info("native_header: left=%d right=%d блоков boundary=%.0fpt sep=%.0fpt",
+             len(left_items), len(right_items), col_boundary, separation)
+
+    skip_set = {idx for idx, _, _, _, _ in header_items}
+
+    # Режим анализа (doc=None) — только возвращаем skip_set без рендера
+    if doc is None:
+        return skip_set
+
+    text_w_inch = (pw - 2 * MARGIN_INCH * 72) / 72
+
+    def _make_block(item, top: float) -> tuple[float, dict]:
+        text = postprocess((getattr(item, "text", None) or "").strip())
+        if not text:
+            return top, {}
+        lbl = _label_str(item)
+        alpha = [c for c in text if c.isalpha()]
+        bold = (lbl in ("title", "section_header") or
+                (bool(alpha) and all(c.isupper() for c in alpha) and len(text) <= 60))
+        return top, {"text": text, "font_pt": BODY_PT, "bold": bold, "italic": False}
+
+    # Собираем блоки правой колонки по top (сверху вниз).
+    # Блоки из left_items ("Заявитель (кредитор):") встраиваем по реальному top —
+    # они должны стоять inline с соответствующим right-блоком.
+    topped_blocks: list[tuple[float, dict]] = []
+
+    if prepend_right_blocks:
+        top_first = min((top for _, _, _, _, top in right_items), default=0.0)
+        for i, blk in enumerate(prepend_right_blocks):
+            topped_blocks.append((top_first - len(prepend_right_blocks) + i, blk))
+
+    for _, item, _, _, top in sorted(right_items, key=lambda e: e[4]):
+        _, blk = _make_block(item, top)
+        if blk:
+            topped_blocks.append((top, blk))
+
+    for _, item, _, _, top in left_items:
+        _, blk = _make_block(item, top)
+        if blk:
+            topped_blocks.append((top, blk))
+
+    topped_blocks.sort(key=lambda x: x[0])
+
+    # Этап 1: coplanar merge (±8pt) — объединяем блоки на одной строке.
+    # Два случая:
+    #   A) label, заканчивающийся ':', + content → label + "\n" + content
+    #   B) осколок (≤2 слова, без пунктуации) + следующий coplanar → prefix + " " + content
+    # Для случая A: используем "\n" чтобы они рендерились на двух строках.
+    # Для случая B: пробел — они читались как одна строка.
+    _RE_FRAG = re.compile(r'^[А-ЯЁа-яёA-Za-z0-9\-]+(?:\s+[А-ЯЁа-яёA-Za-z0-9\-]+)?$')
+    merged: list[tuple[float, dict]] = []
+    used = set()
+    for i, (t_i, blk_i) in enumerate(topped_blocks):
+        if i in used:
+            continue
+        text_i = blk_i.get("text", "").strip()
+        words_i = text_i.split()
+        # A) label + ':' — объединяем через \t (tab) для рендера label | value в строку
+        # Ищем coplanar (±8pt) как вперёд, так и назад по списку.
+        if text_i.rstrip().endswith(":"):
+            partner_j = None
+            # Ищем вперёд
+            for j in range(i + 1, len(topped_blocks)):
+                if j in used:
+                    continue
+                t_j, blk_j = topped_blocks[j]
+                if abs(t_j - t_i) <= 8.0:
+                    partner_j = j
+                    break
+                if t_j - t_i > 8.0:
+                    break
+            # Ищем назад если вперёд не нашли.
+            # Партнёр назад — первая строка текста не является label (нет "Буква:").
+            # НЕ проверяем used — партнёр мог уже попасть в merged как самостоятельный
+            # блок (АКЦИОНЕРНОЕ ОБЩЕСТВО добавляется раньше Заявителя при сортировке).
+            if partner_j is None:
+                for j in range(i - 1, -1, -1):
+                    t_j, blk_j = topped_blocks[j]
+                    blk_j_text = blk_j.get("text", "")
+                    first_line = blk_j_text.split("\n")[0]
+                    has_label_colon = bool(re.search(r'[А-ЯЁа-яёA-Za-z]\s*:', first_line))
+                    if abs(t_j - t_i) <= 8.0 and not has_label_colon:
+                        partner_j = j
+                        break
+                    if t_i - t_j > 8.0:
+                        break
+            if partner_j is not None:
+                t_j, blk_j = topped_blocks[partner_j]
+                combined = text_i + "\t" + blk_j.get("text", "")
+                # Если партнёр уже в merged как самостоятельный блок — удаляем его
+                partner_text = blk_j.get("text", "")
+                for mi in range(len(merged) - 1, -1, -1):
+                    if merged[mi][1].get("text", "") == partner_text:
+                        merged.pop(mi)
+                        break
+                merged.append((t_i, {**blk_i, "text": combined, "bold": True}))
+                used.add(i); used.add(partner_j)
+                continue
+        # B) осколок — coplanar с СЛЕДУЮЩИМ (±4pt), приклеить как префикс
+        elif (len(words_i) <= 2 and _RE_FRAG.match(text_i)
+              and text_i and text_i[-1] not in ".,:;»"):
+            for j in range(i + 1, len(topped_blocks)):
+                if j in used:
+                    continue
+                t_j, blk_j = topped_blocks[j]
+                if abs(t_j - t_i) <= 4.0:
+                    combined = text_i + " " + blk_j.get("text", "")
+                    merged.append((t_i, {**blk_j, "text": combined}))
+                    used.add(i); used.add(j)
+                    break
+        if i not in used:
+            merged.append((t_i, blk_i))
+            used.add(i)
+
+    # Этап 2: исправляем два OCR-артефакта в последовательности блоков:
+    #   А) «по» идёт ПОСЛЕ «доверенности: Аракелян...» (разница top ~2pt)
+    #      → переставляем: «по доверенности: Аракелян...»
+    #   Б) «по доверенности: Аракелян...» стоит сразу после «Представитель АО...»
+    #      → объединяем в одну строку через пробел
+    _RE_DOVERENNOSTI_START = re.compile(r'(?i)^доверенности\s*:.+')
+    _RE_PRED_START = re.compile(r'(?i)^представитель\b')
+    fused: list[tuple[float, dict]] = []
+    for i, (t_i, blk_i) in enumerate(merged):
+        text_i = blk_i.get("text", "").strip()
+        # А) «по» + предыдущий «доверенности: ...» → «по доверенности: ...»
+        if (fused
+                and text_i.lower() == "по"
+                and abs(t_i - fused[-1][0]) <= 15.0):
+            prev_t, prev_blk = fused[-1]
+            prev_txt = prev_blk.get("text", "")
+            if _RE_DOVERENNOSTI_START.match(prev_txt):
+                fused[-1] = (prev_t, {**prev_blk, "text": "по " + prev_txt})
+                continue
+        # Б) «по доверенности: ...» + предыдущий «Представитель АО...» → один блок
+        if (fused
+                and re.match(r'(?i)^по\s+доверенности\b', text_i)
+                and abs(t_i - fused[-1][0]) <= 25.0):
+            prev_t, prev_blk = fused[-1]
+            prev_txt = prev_blk.get("text", "")
+            if _RE_PRED_START.match(prev_txt):
+                fused[-1] = (prev_t, {**prev_blk, "text": prev_txt + " " + text_i})
+                continue
+        fused.append((t_i, blk_i))
+
+    # Этап 3: «Представитель АО...» + следующий «по доверенности: Аракелян...»
+    fused2: list[tuple[float, dict]] = []
+    for t_i, blk_i in fused:
+        text_i = blk_i.get("text", "").strip()
+        if (fused2
+                and re.match(r'(?i)^по\s+доверенности\b', text_i)
+                and _RE_PRED_START.match(fused2[-1][1].get("text", ""))
+                and abs(t_i - fused2[-1][0]) <= 30.0):
+            prev_t, prev_blk = fused2[-1]
+            fused2[-1] = (prev_t, {**prev_blk,
+                "text": prev_blk.get("text", "") + " " + text_i})
+        else:
+            fused2.append((t_i, blk_i))
+    fused = fused2
+
+    # Этап 4: склейка конкретного шаблона «должника) управляющим»» с предыдущим.
+    # Этот блок — хвост фразы «Назначение платежа: ... по согласованию финансовым
+    # управляющим» — оторванный потому что OCR разбил длинную строку на два блока.
+    fused3: list[tuple[float, dict]] = []
+    for t_i, blk_i in fused:
+        text_i = blk_i.get("text", "").strip()
+        if (fused3
+                and re.match(r'(?i)^должника\)', text_i)
+                and abs(t_i - fused3[-1][0]) <= 100.0):
+            prev_t, prev_blk = fused3[-1]
+            fused3[-1] = (prev_t, {**prev_blk,
+                "text": prev_blk.get("text", "") + " " + text_i})
+        else:
+            fused3.append((t_i, blk_i))
+    fused = fused3
+
+    # Второй проход postprocess: исправляем OCR-артефакты в ОБЪЕДИНЁННЫХ блоках.
+    # После Этапов 1-4 некоторые блоки склеены из нескольких частей — фиксы
+    # которые не сработали на отдельных частях могут сработать на склейке.
+    fused = [(t, {**blk, "text": postprocess(blk.get("text", ""))}) for t, blk in fused]
+
+    # Разбивка блока «ИНН представителя ... Адрес представителя ...» на строки.
+    # Аналогично OCR-фиксам для реквизитов юрлица, но специфично для шапки.
+    _RE_ADDR_REP = re.compile(
+        r'\s+(Адрес\s+представителя)', re.IGNORECASE)
+    expanded: list[tuple[float, dict]] = []
+    for t, blk in fused:
+        txt = blk.get("text", "")
+        txt2 = _RE_ADDR_REP.sub(r'\n\1', txt)
+        if txt2 != txt:
+            expanded.append((t, {**blk, "text": txt2}))
+        else:
+            expanded.append((t, blk))
+
+    # space_before: ставим 6pt только при вертикальном разрыве > 40pt
+    # (реквизиты банка идут подряд с ~12pt разрывом — не нужен отступ)
+    final_pairs: list[tuple[float, dict]] = []
+    prev_top: float | None = None
+    for t, blk in expanded:
+        b = dict(blk)
+        b["space_before"] = 6.0 if (prev_top is not None and t - prev_top > 40) else 0.0
+        final_pairs.append((t, b))
+        prev_top = t
+
+    # «Заявитель (кредитор):» — полноширинная строка «метка | значение». Он должен
+    # стоять в СВОЕЙ Y-позиции (сразу после «ДЕЛО №»), а не в конце шапки. Поэтому
+    # делим правоколоночные блоки на above (выше Заявителя) и below (ниже) и рендерим
+    # тремя сегментами: [логотип | above] → «Заявитель: значение» → [пусто | below].
+    _ZAYAV_RE = re.compile(r'^\s*Заявитель\s*\(кредитор\)\s*:', re.IGNORECASE)
+    _zayav_idx: int | None = None
+    for i, (_t, blk) in enumerate(final_pairs):
+        txt = blk.get("text", "")
+        label_part = txt.split("\t")[0] if "\t" in txt else txt
+        if _ZAYAV_RE.match(label_part):
+            _zayav_idx = i
+            break
+
+    if _zayav_idx is not None:
+        above_blocks = [b for _t, b in final_pairs[:_zayav_idx]]
+        zayav_block: dict | None = final_pairs[_zayav_idx][1]
+        below_blocks = [b for _t, b in final_pairs[_zayav_idx + 1:]]
+    else:
+        above_blocks = [b for _t, b in final_pairs]
+        zayav_block = None
+        below_blocks = []
+
+    # Геометрия колонок (лого-колонка = 7см на линейке Word)
+    if logo_data is not None:
+        pil_img, pic_w_pt, img_w_inch = logo_data
+        logo_col_pt = max(7.0 / 2.54 * 72, pic_w_pt)
+        text_zone_pt = pw - 2 * MARGIN_INCH * 72
+        content_col_pt = max(text_zone_pt - logo_col_pt, text_zone_pt * 0.55)
+    else:
+        logo_col_pt = 0.0
+        content_col_pt = pw - 2 * MARGIN_INCH * 72
+
+    def _right_col_cells(blocks: list[dict], with_logo: bool) -> list[dict]:
+        """Ячейки строки: (логотип|пустая лого-колонка) + текст правой колонки."""
+        out: list[dict] = []
+        if logo_data is not None:
+            out.append({
+                "kind": "image",
+                "image": pil_img if with_logo else None,
+                "width_pt": logo_col_pt,
+                "image_width_inch": img_w_inch if with_logo else 0.0,
+                "alignment": WD_ALIGN_PARAGRAPH.LEFT,
+            })
+        out.append({
+            "kind": "text",
+            "blocks": blocks,
+            "width_pt": content_col_pt,
+            "alignment": WD_ALIGN_PARAGRAPH.LEFT,
+        })
+        return out
+
+    # 1) Летерхед: логотип + above (адрес суда, «ДЕЛО №»)
+    add_header_row(doc, _right_col_cells(above_blocks, with_logo=True), text_w_inch)
+    log.info("native_header: летерхед above=%d блоков, content=%.0fpt",
+             len(above_blocks), content_col_pt)
+
+    # 2) «Заявитель (кредитор): | значение» — полноширинный label-content на своём месте
+    if zayav_block is not None:
+        txt = zayav_block.get("text", "")
+        if "\t" in txt:
+            lbl, val = txt.split("\t", 1)
+        else:
+            lbl, val = txt, ""
+        lbl = lbl.rstrip()
+        if not lbl.endswith(":"):
+            lbl += ":"
+        content_items = [{"text": val, "font_pt": BODY_PT, "bold": False, "italic": False}]
+        add_label_content_table(doc, lbl, content_items, text_w_inch, space_before=6.0)
+        log.info("native_header: Заявитель в позиции %d: %r → %r", _zayav_idx, lbl, val[:50])
+
+    # 3) below (Адрес для отправки, Реквизиты, «При перечислении…», Представитель) —
+    #    правым отступом: пустая лого-колонка слева, как продолжение правой колонки.
+    if below_blocks:
+        add_header_row(doc, _right_col_cells(below_blocks, with_logo=False), text_w_inch)
+        log.info("native_header: below=%d блоков (правый отступ)", len(below_blocks))
+
+    log.info("native_header: %d элементов в шапке", len(skip_set))
+    return skip_set
+
 
 # ── Паттерны для build_docx (компилируем один раз) ───────────────────────────
 
 # Детектор «Госпошлина» для склейки соседнего bbox суммы
 _GOSPOSHLINA_RE = re.compile(r'^Госпошлин', re.IGNORECASE)
+
+# Маркер начала штампа электронной подписи
+_ES_STAMP_MARKER_RE = re.compile(
+    r'Электронн\w*\s+подпис\w*\s+действительн', re.IGNORECASE)
 
 # Детекторы строки подписи
 _REPR_RE     = re.compile(r'представитель\s+по\s+доверенности', re.IGNORECASE)
@@ -724,15 +1143,17 @@ def _render_first_page_letterhead(
     page_sizes: dict[int, tuple[float, float]],
     pdf_native: bool,
     ocr_blocks: tuple | None = None,   # (list[TextBlock], img_h) из word_order
-) -> set[int]:
+    logo_only: bool = False,           # True: не рендерить таблицу, вернуть image-данные
+) -> tuple:
     """Render the top first-page image/text row without assuming logo position."""
     # Первая страница — минимальный ключ в page_sizes (может быть 0 или 1)
     first_page = min(page_sizes.keys()) if page_sizes else 1
     pw, ph = page_sizes.get(first_page, (595.0, 842.0))
     log.info("letterhead: first_page=%s pdf_native=%s pw=%.0f ph=%.0f",
              first_page, pdf_native, pw, ph)
+    _empty = (set(), [], None, 0.0, 0.0) if logo_only else (set(), [])
     if ph <= 0 or pw <= 0:
-        return set()
+        return _empty
 
     pictures: list[tuple[int, object, object, float, float]] = []
     for idx, (item, _level) in enumerate(all_items):
@@ -754,7 +1175,7 @@ def _render_first_page_letterhead(
 
     if not pictures:
         log.info("letterhead: картинки не найдены — используется старый код add_sidebyside")
-        return set()
+        return _empty
 
     pic_idx, pic_item, pic_bbox, pic_top, pic_bottom = min(pictures, key=lambda x: x[3])
     pic_h = max(pic_bottom - pic_top, 1.0)
@@ -812,13 +1233,15 @@ def _render_first_page_letterhead(
     except Exception:
         pil_img = None
     if pil_img is None:
-        return set()
+        return _empty
 
     text_w_inch = (pw - 2 * MARGIN_INCH * 72) / 72
     pic_l = float(getattr(pic_bbox, "l", 0.0))
     pic_r = float(getattr(pic_bbox, "r", pic_l))
     pic_w_pt = max(pic_r - pic_l, 1.0)
     img_w_inch = min(max(pic_w_pt / 72, 0.5), text_w_inch)
+    log.info("letterhead: pic_l=%.1f pic_r=%.1f pic_w_pt=%.1f img_w_inch=%.3f",
+             pic_l, pic_r, pic_w_pt, img_w_inch)
 
     left_blocks = []
     right_blocks = []
@@ -857,10 +1280,8 @@ def _render_first_page_letterhead(
         "alignment": detect_alignment(pic_bbox, pw),
     })
 
-    if right_blocks:
+    if right_blocks and not logo_only:
         # Ширина правой колонки = от правого края логотипа до правого поля страницы.
-        # Предыдущий вариант брал max bbox.r из text_blocks — мог недооценивать,
-        # если Docling давал неправильные правые края для строк реквизитов.
         right_w = max(pw - pic_r, 72.0)
         cells.append({
             "kind": "text",
@@ -912,11 +1333,21 @@ def _render_first_page_letterhead(
     for i, rb in enumerate(right_blocks):
         full_text = rb.get("text", "")
         log.info("  right_block[%d] (%d chars): %r", i, len(full_text), full_text)
-    add_header_row(doc, cells, text_w_inch)
+
     skip_set = {pic_idx, *text_indices}
+
+    if logo_only:
+        # Не рендерим таблицу — native_header построит единую 2-колоночную таблицу.
+        # Skip только лого: текстовые блоки оставляем для native_header чтобы он
+        # мог собрать все блоки шапки включая те что letterhead отфильтровал.
+        log.info("letterhead logo_only: пропуск рендера, возвращаем только лого для native_header")
+        return {pic_idx}, [], pil_img, pic_w_pt, img_w_inch
+
+    add_header_row(doc, cells, text_w_inch)
     log.info("letterhead: skip_indices добавлены — pic_idx=%d, text_idx=%s",
              pic_idx, sorted(text_indices))
-    return skip_set
+    # Возвращаем right_blocks=[] когда не logo_only — native_header не используется
+    return skip_set, []
 
 
 def build_docx(
@@ -924,6 +1355,8 @@ def build_docx(
     page_sizes: dict[int, tuple[float, float]],
     ocr_reader=None,
     use_word_order: bool = True,
+    doc_type: str | None = None,
+    page_infos=None,
 ) -> object:
     """
     Конвертирует DoclingDocument в python-docx Document.
@@ -932,8 +1365,13 @@ def build_docx(
         dl_doc         — Docling DoclingDocument
         page_sizes     — {page_no: (width_pt, height_pt)}
         ocr_reader     — EasyOCR Reader для word_order (None = отключить)
-        use_word_order — True: пересортировать блоки через word_order (текст Docling сохраняется)
+        use_word_order — True: пересортировать блоки через word_order
+        doc_type       — тип документа из doc_type.detect_doc_type() (None = авто)
+        page_infos     — PageInfo из page_analyser.analyse_pages() (None = не используется)
     """
+    from .doc_type import detect_doc_type, DOC_LEGAL
+    from .legal_fixes import apply_legal_fixes
+
     all_items = list(dl_doc.iterate_items())
     log.info("build_docx: %d элементов из Docling, %d страниц",
              len(all_items), len(page_sizes))
@@ -966,14 +1404,27 @@ def build_docx(
             all_items = _reorder_by_word_order(all_items, word_blocks_map, page_sizes)
             log.info("word_order: переупорядочено на %d стр.", len(word_blocks_map))
 
-    # Пост-обработка: ALL-CAPS заголовки перед subtitle, numbered list в порядке
-    all_items, _continuation_ids = _fix_reading_order(all_items)
+    # Определяем тип документа если не передан извне
+    if doc_type is None:
+        doc_type = detect_doc_type(all_items)
+        log.info("build_docx: doc_type=%s (авто)", doc_type)
+    else:
+        log.info("build_docx: doc_type=%s (передан)", doc_type)
+
+    # Пост-обработка порядка блоков: только для судебных документов
+    _continuation_ids: set = set()
+    if doc_type == DOC_LEGAL:
+        all_items, _continuation_ids = apply_legal_fixes(all_items)
+    else:
+        # Для других типов — базовые исправления из старого кода
+        all_items, _continuation_ids = _fix_reading_order(all_items)
 
     doc               = init_document()
     last_content_page = -1
     current_page      = -1
     prev_midY: dict[int, float] = {}
     prev_h:    dict[int, float] = {}
+    _gosposhlina_bold = False
 
     # ── Трекинг продолжений (orphan-блоки Docling) ────────────────────────────
     # Docling иногда разрывает абзац: конец одного блока + начало следующего
@@ -991,9 +1442,10 @@ def build_docx(
     # (названия законов, цитаты), а «;» — внутри перечислений.
     _SENT_END_RE = re.compile(r'[.!?]\s*$')
 
-    _last_body_para:  object = None  # последний Word-параграф тела документа
-    _last_body_text:  str    = ""    # его текст (для проверки завершённости)
-    _seen_text_pages: set    = set() # страницы, на которых уже был text-блок
+    _last_body_para:      object   = None  # последний Word-параграф тела документа
+    _last_body_text:      str      = ""    # его текст (для проверки завершённости)
+    _seen_text_pages:     set      = set() # страницы, на которых уже был text-блок
+    _image_pages_rendered: set[int] = set() # страницы уже вставленные как картинки
     skip_indices: set[int] = set()
 
     def _page_break(target: int) -> None:
@@ -1013,14 +1465,50 @@ def build_docx(
 
     # Передаём OCR-блоки первой страницы для дополнения шапки
     first_page_no = min(page_sizes.keys()) if page_sizes else 1
-    letterhead_indices = _render_first_page_letterhead(
+
+    # Предварительно определяем: есть ли двухколоночная шапка на первой странице.
+    # Если есть — letterhead рендерит только лого, а native_header строит полную
+    # двухколоночную таблицу (включая блоки которые иначе ушли бы в letterhead).
+    _native_preview = _render_native_two_column_header(
+        None, all_items, page_sizes, pdf_native,  # doc=None — только анализ
+        page_medians, page_left_min,
+        already_skipped=set(),
+    )
+    _has_two_col_header = bool(_native_preview)
+
+    _lh_result = _render_first_page_letterhead(
         doc, dl_doc, all_items, page_sizes, pdf_native,
         ocr_blocks=word_blocks_map.get(first_page_no),
+        logo_only=_has_two_col_header,
     )
+    if len(_lh_result) == 5:
+        # logo_only=True → (skip_set, right_blocks, pil_img, pic_w_pt, img_w_inch)
+        letterhead_indices, _lh_right_blocks, _lh_image, _lh_pic_w_pt, _lh_img_w_inch = _lh_result
+    else:
+        # logo_only=False → (skip_set, [])
+        letterhead_indices, _lh_right_blocks = _lh_result
+        _lh_image = _lh_img_w_inch = _lh_pic_w_pt = None
+
     if letterhead_indices:
         skip_indices.update(letterhead_indices)
         last_content_page = first_page_no
         log.info("letterhead: пропускаем %d элементов шапки", len(letterhead_indices))
+
+    # Двухколоночная шапка с лого — letterhead передаёт image данные,
+    # native_header строит единую 3-колоночную таблицу: [лого | label | content].
+    _prepend = _lh_right_blocks if _has_two_col_header else None
+    _logo_data = (_lh_image, _lh_pic_w_pt, _lh_img_w_inch) if _has_two_col_header else None
+    native_indices = _render_native_two_column_header(
+        doc, all_items, page_sizes, pdf_native,
+        page_medians, page_left_min,
+        already_skipped=skip_indices,
+        prepend_right_blocks=_prepend,
+        logo_data=_logo_data,
+    )
+    if native_indices:
+        skip_indices.update(native_indices)
+        last_content_page = first_page_no
+        log.info("native_header: пропускаем %d элементов шапки", len(native_indices))
 
     # ── Детальный дамп стр.1 для диагностики рендера ─────────────────────────
     _pg1 = min(page_sizes.keys()) if page_sizes else 1
@@ -1071,6 +1559,8 @@ def build_docx(
         WD_ALIGN_PARAGRAPH.RIGHT:   "RIGHT",
     }
 
+    _es_stamp_rendered = False
+
     for idx, (item, _level) in enumerate(all_items):
         if idx in skip_indices:
             raw = (getattr(item, "text", None) or "").strip()[:50]
@@ -1087,8 +1577,76 @@ def build_docx(
         current_page  = page_no
 
         pw, ph    = page_sizes.get(page_no, (595.0, 842.0))
+
+        # ── Штамп электронной подписи (ЭП) ───────────────────────────────────
+        # Маркер «Электронная подпись действительна» открывает штамп ЭП. Собираем
+        # его короткие строки (Данные ЭП / Удостоверяющий центр / Дата / Кому
+        # выдана) и рендерим в обрамлённой рамке. Строку-метку, оканчивающуюся
+        # на «:», склеиваем со следующей (значением).
+        if (not _es_stamp_rendered
+                and lbl in ("text", "paragraph")
+                and _ES_STAMP_MARKER_RE.search(getattr(item, "text", "") or "")):
+            _stamp_raw: list[str] = []
+            for _sj in range(idx, len(all_items)):
+                if _sj in skip_indices:
+                    continue
+                _sit, _ = all_items[_sj]
+                if _label_str(_sit) not in ("text", "paragraph", "list_item"):
+                    continue
+                _sbbox, _sp = _item_bbox_page(_sit, page_no)
+                if _sp != page_no:
+                    break
+                _stext = postprocess((getattr(_sit, "text", None) or "").strip())
+                if not _stext:
+                    continue
+                if len(_stext) > 130:    # длинный абзац — не часть штампа
+                    break
+                _stamp_raw.append(_stext)
+                skip_indices.add(_sj)
+            # Склеиваем «метка:» + следующая строка
+            _stamp_lines: list[str] = []
+            for _ln in _stamp_raw:
+                if _stamp_lines and _stamp_lines[-1].rstrip().endswith(":"):
+                    _stamp_lines[-1] = _stamp_lines[-1].rstrip() + " " + _ln
+                else:
+                    _stamp_lines.append(_ln)
+            _es_tw = (pw - 2 * MARGIN_INCH * 72) / 72
+            _page_break(page_no)
+            add_es_stamp(doc, _stamp_lines, _es_tw)
+            _es_stamp_rendered = True
+            log.info("[стр%d] ЭП-штамп: %d строк в рамке", page_no, len(_stamp_lines))
+            continue
         median_h  = page_medians.get(page_no, 0.0)
         item_h    = bbox_h(bbox) if bbox is not None else 0.0
+
+        # ── Страница-картинка (median_h=0, нет текстовых блоков) ──────────────
+        # Вставляем страницу целиком как изображение через picture-элемент.
+        # Остальные элементы этой страницы пропускаем.
+        if (median_h == 0.0 and page_no not in _image_pages_rendered
+                and lbl in ("picture", "figure", "image")):
+            _image_pages_rendered.add(page_no)
+            try:
+                pil_img = item.get_image(dl_doc)
+                if pil_img is not None:
+                    from io import BytesIO as _BytesIO
+                    _buf = _BytesIO()
+                    pil_img.save(_buf, format="PNG")
+                    _buf.seek(0)
+                    text_w_inch = (pw - 2 * MARGIN_INCH * 72) / 72
+                    _page_break(page_no)
+                    _para = doc.add_paragraph()
+                    _para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    _para.paragraph_format.space_before = Pt(0)
+                    _para.paragraph_format.space_after  = Pt(0)
+                    _iw, _ih = pil_img.size
+                    _aspect  = _ih / _iw if _iw > 0 else 1.0
+                    _tw      = min(text_w_inch, (ph - 2 * MARGIN_INCH * 72) / 72 / _aspect)
+                    _para.add_run().add_picture(_buf, width=Inches(max(_tw, 0.5)))
+                    log.info("[стр%d] PAGE_IMAGE: вставлена страница как картинка %dx%d px",
+                             page_no, pil_img.width, pil_img.height)
+            except Exception as _exc:
+                log.debug("[стр%d] PAGE_IMAGE: ошибка вставки: %s", page_no, _exc)
+            continue
 
         font_pt = LABEL_PT.get(lbl, BODY_PT)
         # section_header в правой части первой страницы (блок сторон: «Арбитражный суд»,
@@ -1325,6 +1883,74 @@ def build_docx(
                         log.info("[стр%d] Госпошлина merge: %r", page_no, text)
                     break
 
+        # ── Coplanar-пары: «Метка:» (левая колонка) + значение (правая) ─────────
+        # Паттерн: текущий блок заканчивается на «:» и находится в левой части
+        # страницы, а следующий непропущенный блок — coplanar и правее.
+        # Пример: «Место рождения:» (x0=172) + «ГОР. РОСТОВ-НА-ДОНУ» (x0=265)
+        _coplanar_rendered = False
+        if (lbl in ("text", "paragraph") and bbox is not None
+                and text.rstrip().endswith(":")
+                and float(getattr(bbox, "l", 0)) < pw * 0.50
+                and float(getattr(bbox, "r", pw)) < pw * 0.55):
+            _cp_value_idx = None
+            _label_right = float(getattr(bbox, "r", 0))
+            # Верх метки: в pdf_native t>b, поэтому берём max(t,b)
+            _label_top = max(float(getattr(bbox, "t", 0)), float(getattr(bbox, "b", 0)))
+            # Ищем до 10 следующих элементов: партнёр должен быть правее метки
+            # и начинаться на той же вертикальной позиции (верх bbox ±8pt).
+            # Используем top (верх блока) а не mid_y: для многострочных значений
+            # (Паспортные данные h=50pt) mid_y смещается вниз, top совпадает с меткой.
+            for _cj in range(idx + 1, min(idx + 10, len(all_items))):
+                if _cj in skip_indices:
+                    continue
+                _cj_item, _ = all_items[_cj]
+                _cj_prov = getattr(_cj_item, "prov", None) or []
+                if not _cj_prov or int(getattr(_cj_prov[0], "page_no", -1)) != page_no:
+                    break
+                _cj_bbox = getattr(_cj_prov[0], "bbox", None)
+                if _cj_bbox is None:
+                    continue
+                _cj_x0 = float(getattr(_cj_bbox, "l", 0))
+                _cj_top = max(float(getattr(_cj_bbox, "t", 0)), float(getattr(_cj_bbox, "b", 0)))
+                # Значение должно быть правее метки и на той же строке (top ±8pt).
+                # 14pt было слишком широко: Должник:(253.3) захватывал ГОР.РОСТОВ(239.6) diff=13.7
+                if _cj_x0 > _label_right and abs(_cj_top - _label_top) <= 8.0:
+                    _cp_value_idx = _cj
+                    break
+                # Если встретили метку в ПРАВОЙ части страницы — это значение другого поля,
+                # дальше не ищем (значение нашего поля было бы левее этого блока).
+                # Метки в ЛЕВОЙ части (x0 < label_right) просто пропускаем.
+                _cj_lbl = _label_str(_cj_item)
+                if (_cj_lbl in ("text", "paragraph")
+                        and (getattr(_cj_item, "text", None) or "").rstrip().endswith(":")
+                        and _cj_x0 >= _label_right):
+                    break
+            if _cp_value_idx is not None:
+                _cj_item, _ = all_items[_cp_value_idx]
+                _cj_text = postprocess((getattr(_cj_item, "text", None) or "").strip())
+                if _cj_text:
+                    _full_tw = (pw - 2 * MARGIN_INCH * 72) / 72
+                    _cp_x0   = float(getattr(
+                        getattr((getattr(_cj_item, "prov", None) or [None])[0], "bbox", None) or type("", (), {"l": pw * 0.45})(),
+                        "l", pw * 0.45))
+                    _cp_col  = max((_cp_x0 - MARGIN_INCH * 72) / 72, 0.5)
+                    _cp_ratio = min(_cp_col / _full_tw, 0.65)
+                    _cp_label_bold = bool([c for c in text if c.isalpha()])
+                    add_label_content_table(
+                        doc,
+                        text.rstrip(":").rstrip() + ":",
+                        [{"text": _cj_text, "font_pt": BODY_PT, "bold": False, "italic": False}],
+                        _full_tw,
+                        space_before,
+                        indent_inch=0.0,
+                        col_ratio=_cp_ratio,
+                    )
+                    skip_indices.add(_cp_value_idx)
+                    _coplanar_rendered = True
+                    log.info("[стр%d] coplanar-pair: %r → %r", page_no, text[:40], _cj_text[:40])
+        if _coplanar_rendered:
+            continue
+
         # ── Блоки МЕТКА:содержимое ────────────────────────────────────────────
         _item_x0 = float(getattr(bbox, "l", 0)) if bbox is not None else 0.0
         lc = split_label_content(text) if _item_x0 <= pw * LABEL_MARGIN_THRESHOLD else None
@@ -1450,11 +2076,32 @@ def build_docx(
                 para.paragraph_format.left_indent = Pt(_h_indent_in * 72)
             else:
                 para.paragraph_format.left_indent = Pt(0)
-            run                = para.add_run(text)
-            run.font.name      = FONT_NAME
-            run.font.size      = Pt(font_pt)
-            run.font.bold      = True
-            run.font.color.rgb = RGBColor(0, 0, 0)
+            # Заголовок «тип документа + подзаголовок» («ЗАЯВЛЕНИЕ о включении …»):
+            # Docling склеивает в один section_header, но в оригинале тип документа
+            # стоит ОТДЕЛЬНОЙ строкой. Выносим ЗАГЛАВНЫЙ тип на свою строку.
+            # Срабатывает только для центрированного section_header, где за ALL-CAPS
+            # словом(ами) следует строчное продолжение.
+            _title_m = (re.match(r'^([А-ЯЁ][А-ЯЁ]+(?:\s+[А-ЯЁ]+)*)\s+([а-яё].*)$',
+                                 text, re.DOTALL)
+                        if lbl == "section_header"
+                           and alignment == WD_ALIGN_PARAGRAPH.CENTER
+                        else None)
+
+            def _style_run(_r):
+                _r.font.name      = FONT_NAME
+                _r.font.size      = Pt(font_pt)
+                _r.font.bold      = True
+                _r.font.color.rgb = RGBColor(0, 0, 0)
+
+            if _title_m:
+                run = para.add_run(_title_m.group(1))
+                _style_run(run)
+                run.add_break()
+                run2 = para.add_run(_title_m.group(2))
+                _style_run(run2)
+            else:
+                run = para.add_run(text)
+                _style_run(run)
             continue
 
         # ── Списки ────────────────────────────────────────────────────────────
@@ -1690,6 +2337,29 @@ def build_docx(
 
 # ── Публичные функции ─────────────────────────────────────────────────────────
 
+def _is_native_pdf(pdf_path: Path) -> bool:
+    """Возвращает True если PDF содержит текстовый слой (не чистый скан).
+
+    Проверяет первые 3 страницы: если хотя бы на одной есть текстовые блоки
+    с реальным содержимым — PDF нативный и word_order не нужен.
+    """
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(str(pdf_path))
+        for i in range(min(3, doc.page_count)):
+            blocks = doc[i].get_text("blocks")
+            for b in blocks:
+                if b[6] == 0:  # текстовый блок
+                    text = b[4].strip()
+                    if len(text) > 10:  # есть реальный текст
+                        doc.close()
+                        return True
+        doc.close()
+    except Exception:
+        pass
+    return False
+
+
 def convert_pdf(
     pdf_path: Path,
     docx_path: Path,
@@ -1699,6 +2369,17 @@ def convert_pdf(
 ) -> bool:
     log.info("  Конвертация: %s", pdf_path.name)
     try:
+        # Нативные PDF не нуждаются в EasyOCR для word_order —
+        # Docling сам правильно читает порядок блоков из текстового слоя.
+        # Это ускоряет конвертацию с ~4 мин до ~10 сек на файл.
+        effective_word_order = use_word_order
+        if use_word_order and ocr_reader is not None:
+            if _is_native_pdf(pdf_path):
+                effective_word_order = False
+                log.info("  native PDF — word_order отключён (EasyOCR не нужен)")
+            else:
+                log.info("  scan PDF — word_order включён (EasyOCR)")
+
         result = converter.convert(str(pdf_path))
         dl_doc = result.document
 
@@ -1712,7 +2393,7 @@ def convert_pdf(
                 )
 
         doc = build_docx(dl_doc, page_sizes, ocr_reader=ocr_reader,
-                         use_word_order=use_word_order)
+                         use_word_order=effective_word_order)
         doc.save(str(docx_path))
         log.info("  ✓ %s", docx_path.name)
         return True

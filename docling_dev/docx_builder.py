@@ -107,8 +107,9 @@ def _set_cell_borders(cell) -> None:
     tcPr.append(borders)
 
 
-def _make_borderless_table(doc: Document, n_cols: int) -> object:
-    """Создаёт таблицу без видимых границ."""
+def _make_borderless_table(doc: Document, n_cols: int,
+                           total_width_dxa: int | None = None) -> object:
+    """Создаёт таблицу без видимых границ с фиксированной раскладкой ячеек."""
     tbl       = doc.add_table(rows=1, cols=n_cols)
     tbl.style = "Normal Table"
     tbl_el    = tbl._tbl
@@ -116,6 +117,16 @@ def _make_borderless_table(doc: Document, n_cols: int) -> object:
     if tbl_pr is None:
         tbl_pr = OxmlElement("w:tblPr")
         tbl_el.insert(0, tbl_pr)
+    # Фиксированная раскладка — Word не пересчитывает ширины
+    tbl_layout = OxmlElement("w:tblLayout")
+    tbl_layout.set(qn("w:type"), "fixed")
+    tbl_pr.append(tbl_layout)
+    # Явная ширина таблицы
+    if total_width_dxa is not None:
+        tbl_w = OxmlElement("w:tblW")
+        tbl_w.set(qn("w:w"), str(total_width_dxa))
+        tbl_w.set(qn("w:type"), "dxa")
+        tbl_pr.append(tbl_w)
     tbl_brd = OxmlElement("w:tblBorders")
     for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
         el = OxmlElement(f"w:{side}")
@@ -131,6 +142,9 @@ def _set_cell_width(cell, width_inch: float) -> None:
     if tcp is None:
         tcp = OxmlElement("w:tcPr")
         tc.insert(0, tcp)
+    # Удаляем все существующие w:tcW чтобы наш был единственным
+    for _old in tcp.findall(qn("w:tcW")):
+        tcp.remove(_old)
     tcw = OxmlElement("w:tcW")
     tcw.set(qn("w:w"), str(int(width_inch * 1440)))
     tcw.set(qn("w:type"), "dxa")
@@ -257,19 +271,30 @@ def add_header_row(
     if not cells:
         return
 
-    tbl = _make_borderless_table(doc, len(cells))
-    total_pt = sum(max(float(c.get("width_pt", 0.0)), 1.0) for c in cells)
-    used_width = 0.0
+    # Суммарная ширина всех ячеек в dxa для фиксированной раскладки
+    col_dxa_list = [
+        int(max(float(c.get("width_pt", 72.0)), 1.0) / 72.0 * 1440)
+        for c in cells
+    ]
+    total_dxa = sum(col_dxa_list)
+    tbl = _make_borderless_table(doc, len(cells), total_width_dxa=total_dxa)
+
+    # Перезаписываем tblGrid правильными ширинами колонок — иначе Word игнорирует tcW
+    tbl_el = tbl._tbl
+    tbl_grid = tbl_el.find(qn("w:tblGrid"))
+    if tbl_grid is not None:
+        for gc in tbl_grid.findall(qn("w:gridCol")):
+            tbl_grid.remove(gc)
+        for dxa in col_dxa_list:
+            gc = OxmlElement("w:gridCol")
+            gc.set(qn("w:w"), str(dxa))
+            tbl_grid.append(gc)
 
     for idx, cell_data in enumerate(cells):
         cell = tbl.cell(0, idx)
-        if idx == len(cells) - 1:
-            col_w = max(text_zone_inch - used_width, 1.0)
-        else:
-            ratio = max(float(cell_data.get("width_pt", 0.0)), 1.0) / total_pt
-            col_w = max(text_zone_inch * ratio, 1.0)
-            used_width += col_w
-        _set_cell_width(cell, col_w)
+        # Используем абсолютную ширину в pt чтобы ячейки встали точно
+        col_w_inch = max(float(cell_data.get("width_pt", 72.0)), 1.0) / 72.0
+        _set_cell_width(cell, col_w_inch)
 
         # Убираем внутренние поля ячейки чтобы текст занимал максимальную ширину
         _tc = cell._tc
@@ -294,23 +319,68 @@ def add_header_row(
             buf = BytesIO()
             pil_img.save(buf, format="PNG")
             buf.seek(0)
-            img_w = min(float(cell_data.get("image_width_inch", col_w)), col_w - 0.05)
+            img_w = min(float(cell_data.get("image_width_inch", col_w_inch)), col_w_inch - 0.05)
             if img_w > 0:
                 para.add_run().add_picture(buf, width=Inches(img_w))
             continue
+
+        # Tab-stop для label\tcontent блоков: 5cm от левого края ячейки
+        _tab_stop_dxa = int(5.0 * 567)  # 5cm в dxa
 
         first = True
         for block in cell_data.get("blocks", []):
             p = para if first else cell.add_paragraph()
             first = False
             p.alignment = cell_data.get("alignment", WD_ALIGN_PARAGRAPH.LEFT)
-            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_before = Pt(block.get("space_before", 0.0))
             p.paragraph_format.space_after = Pt(0)
-            run = p.add_run(block.get("text", ""))
-            run.font.name = FONT_NAME
-            run.font.size = Pt(block.get("font_pt", 8.5))
-            run.bold = block.get("bold", False)
-            run.italic = block.get("italic", False)
+            text = block.get("text", "")
+            font_pt = block.get("font_pt", 8.5)
+            blk_bold = block.get("bold", False)
+            blk_italic = block.get("italic", False)
+            # Поддержка \t (label\tcontent) и \n (перенос строки)
+            # \t разбивает на [label_bold, tab, content_normal]
+            if "\t" in text:
+                # Устанавливаем tab-stop на 5cm от края ячейки
+                pPr = p._p.get_or_add_pPr()
+                tabs_el = OxmlElement("w:tabs")
+                tab_el = OxmlElement("w:tab")
+                tab_el.set(qn("w:val"), "left")
+                tab_el.set(qn("w:pos"), str(_tab_stop_dxa))
+                tabs_el.append(tab_el)
+                pPr.append(tabs_el)
+
+                label_part, _, content_part = text.partition("\t")
+                # Метка — жирный
+                r_label = p.add_run(label_part)
+                r_label.font.name = FONT_NAME
+                r_label.font.size = Pt(font_pt)
+                r_label.bold = True
+                r_label.italic = blk_italic
+                # TAB run
+                r_tab = p.add_run("\t")
+                r_tab.font.name = FONT_NAME
+                r_tab.font.size = Pt(font_pt)
+                # Содержимое после \t — может содержать \n
+                sub_parts = content_part.split("\n")
+                for k, sp in enumerate(sub_parts):
+                    if k > 0:
+                        p.add_run().add_break()
+                    r = p.add_run(sp)
+                    r.font.name = FONT_NAME
+                    r.font.size = Pt(font_pt)
+                    r.bold = False
+                    r.italic = blk_italic
+            else:
+                parts = text.split("\n")
+                for k, part in enumerate(parts):
+                    if k > 0:
+                        p.add_run().add_break()
+                    run = p.add_run(part)
+                    run.font.name = FONT_NAME
+                    run.font.size = Pt(font_pt)
+                    run.bold = blk_bold
+                    run.italic = blk_italic
 
     doc.add_paragraph()
 
@@ -394,6 +464,60 @@ def add_signature_row(
         run.bold      = True
 
 
+def add_es_stamp(doc: Document, lines: list[str], width_inch: float) -> None:
+    """Штамп электронной подписи в виде рамки (одна ячейка с границами).
+
+    Воспроизводит визуальный штамп ЭП из исходного PDF: каждая строка штампа
+    («Электронная подпись действительна», «Данные ЭП: …», «Дата …», «Кому
+    выдана: …») рендерится отдельным абзацем внутри одной обрамлённой ячейки.
+    """
+    lines = [ln for ln in (l.strip() for l in lines) if ln]
+    if not lines:
+        return
+    box_w = max(min(width_inch * 0.62, width_inch), 2.0)
+    tbl = doc.add_table(rows=1, cols=1)
+    tbl.style = "Normal Table"
+    # Фиксированная раскладка + явная ширина
+    tbl_el = tbl._tbl
+    tbl_pr = tbl_el.find(qn("w:tblPr"))
+    if tbl_pr is None:
+        tbl_pr = OxmlElement("w:tblPr")
+        tbl_el.insert(0, tbl_pr)
+    _layout = OxmlElement("w:tblLayout")
+    _layout.set(qn("w:type"), "fixed")
+    tbl_pr.append(_layout)
+    _tw = OxmlElement("w:tblW")
+    _tw.set(qn("w:w"), str(int(box_w * 1440)))
+    _tw.set(qn("w:type"), "dxa")
+    tbl_pr.append(_tw)
+
+    cell = tbl.cell(0, 0)
+    # Ширина ячейки задаём напрямую (без nil-границ, которые ставит _set_cell_width,
+    # иначе они конфликтуют с видимой рамкой ниже).
+    _tc  = cell._tc
+    _tcp = _tc.get_or_add_tcPr()
+    for _old in _tcp.findall(qn("w:tcW")):
+        _tcp.remove(_old)
+    _tcw = OxmlElement("w:tcW")
+    _tcw.set(qn("w:w"), str(int(box_w * 1440)))
+    _tcw.set(qn("w:type"), "dxa")
+    _tcp.insert(0, _tcw)
+    _set_cell_borders(cell)        # видимая рамка штампа
+
+    for p in cell.paragraphs:
+        p.clear()
+    for i, ln in enumerate(lines):
+        para = cell.paragraphs[0] if i == 0 else cell.add_paragraph()
+        para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        para.paragraph_format.space_before = Pt(0)
+        para.paragraph_format.space_after  = Pt(0)
+        run = para.add_run(ln)
+        run.font.name = FONT_NAME
+        run.font.size = Pt(9.0)
+        run.italic    = True
+    doc.add_paragraph()
+
+
 def split_label_content(text: str) -> tuple[str, str] | None:
     """Возвращает (метка, содержимое) если текст начинается с ALL-CAPS метки."""
     m = LABEL_LINE_RE.match(text.strip())
@@ -401,7 +525,8 @@ def split_label_content(text: str) -> tuple[str, str] | None:
         return None
     label = m.group(1).strip()
     alpha = [c for c in label if c.isalpha()]
-    if not alpha or not all(c.isupper() for c in alpha) or len(alpha) < 3:
+    # Минимум 4 буквы: исключаем ИНН, БИК, КПП — они реквизиты, не метки блоков
+    if not alpha or not all(c.isupper() for c in alpha) or len(alpha) < 4:
         return None
     return label, m.group(2).strip()
 
