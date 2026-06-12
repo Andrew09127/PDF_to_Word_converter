@@ -21,7 +21,14 @@ def build_converter(langs: list[str] | None = None) -> DocumentConverter:
     if langs is None:
         langs = ["ru", "en"]
 
+    # confidence_threshold ниже дефолтного 0.5: при 72 DPI EasyOCR помечал
+    # часть реальных слов как «неуверенные» и Docling их ОТБРАСЫВАЛ (терялись
+    # «В связи», предлоги). 0.2 сохраняет такие слова.
     ocr_opts = EasyOcrOptions(lang=langs, force_full_page_ocr=True)
+    try:
+        ocr_opts.confidence_threshold = 0.2
+    except Exception:
+        pass
 
     pipeline_opts = PdfPipelineOptions()
     pipeline_opts.do_ocr                                   = True
