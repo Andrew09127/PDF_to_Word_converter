@@ -37,8 +37,21 @@ _DIGIT_RE = re.compile(r"\d")
 _HAS_CYR  = re.compile(r"[А-Яа-яЁё]")
 _ROMAN_RE = re.compile(r"^[IVXLCDM]{1,7}$", re.IGNORECASE)
 _SYSTEM = ("Ты исправляешь ошибки распознавания (OCR) в русском юридическом "
-           "тексте. В ответе — ТОЛЬКО одно правильное русское слово, без кавычек "
-           "и пояснений. Не меняй цифры, номера, ФИО.")
+           "тексте. В ответе — ТОЛЬКО исправленный фрагмент (1–3 слова), без "
+           "кавычек и пояснений. Не меняй цифры и номера. Если фрагмент не "
+           "ошибка или не можешь исправить — повтори его без изменений.")
+
+# Few-shot: маленькой модели примеры заметно повышают стабильность.
+_FEWSHOT = [
+    ("Предложение: «двадцать три рубля); в тоM числе:»\n"
+     "Искажённый фрагмент: «тоM»\nИсправление:", "том"),
+    ("Предложение: «осуществляющему деятельность пО возврату задолженности»\n"
+     "Искажённый фрагмент: «пО»\nИсправление:", "по"),
+    ("Предложение: «Договором уступки права требованияNе 14-02-25 БД-Айди»\n"
+     "Искажённый фрагмент: «требованияNе»\nИсправление:", "требования №"),
+    ("Предложение: «включая услуги wlw сбор информации»\n"
+     "Искажённый фрагмент: «wlw»\nИсправление:", "wlw"),
+]
 
 _llm = None          # ленивый singleton модели (грузим один раз на весь батч)
 _llm_failed = False
@@ -97,15 +110,15 @@ def _get_llm(model_path: str):
 
 def _ask(llm, word: str, ctx: str) -> str | None:
     try:
-        out = llm.create_chat_completion(
-            messages=[
-                {"role": "system", "content": _SYSTEM},
-                {"role": "user", "content":
-                    f"Предложение: «{ctx[:400]}»\n"
-                    f"Искажённое слово: «{word}»\nПравильное слово:"},
-            ],
-            temperature=0.0, max_tokens=16,
-        )
+        msgs = [{"role": "system", "content": _SYSTEM}]
+        for u, a in _FEWSHOT:                 # few-shot примеры
+            msgs.append({"role": "user", "content": u})
+            msgs.append({"role": "assistant", "content": a})
+        msgs.append({"role": "user", "content":
+                     f"Предложение: «{ctx[:400]}»\n"
+                     f"Искажённый фрагмент: «{word}»\nИсправление:"})
+        out = llm.create_chat_completion(messages=msgs, temperature=0.0,
+                                         max_tokens=16)
         return (out["choices"][0]["message"]["content"] or "").strip()
     except Exception as exc:
         log.debug("LLM: запрос не удался: %s", exc)
@@ -138,7 +151,7 @@ def _accept(orig: str, cand: str | None) -> str | None:
         return None
     if _ROMAN_RE.match(orig) or not _HAS_CYR.search(orig):
         return None                          # римские цифры/коды/латиница — не правим
-    if " " in cand or "\t" in cand:          # должно остаться ОДНО слово
+    if "\t" in cand or len(cand.split()) > 3:  # допускаем 1–3 слова (требования №)
         return None
     if _digits(cand) != _digits(orig):       # цифры менять запрещено
         return None

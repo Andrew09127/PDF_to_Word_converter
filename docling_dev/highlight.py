@@ -80,6 +80,12 @@ def suspicious_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
+# Частые короткие предлоги/союзы — для снятия капс-шума (пО→по, cO→со).
+# НЕ включаем «кв» и т.п. единицы, чтобы не сломать «кВ» (киловольт).
+_COMMON_SHORT = {"по", "со", "из", "от", "на", "не", "до", "за", "об", "во",
+                 "ко", "но", "да", "и", "в", "с", "к", "у", "о", "а"}
+
+
 # Латиница → кириллица (визуальные двойники) — для очистки гомоглифов
 _LAT2CYR = {
     "a": "а", "c": "с", "e": "е", "o": "о", "p": "р", "x": "х", "y": "у",
@@ -97,14 +103,21 @@ def _autofix_word(core: str) -> str | None:
     иначе None (оставляем подсветку).
     """
     w = core
-    n_low = sum(1 for c in w if c.islower())
-    n_up  = sum(1 for c in w if c.isupper())
-    if n_up and n_low > n_up:           # слово в нижнем регистре со «скачущими» CAPS
-        w = w.lower()
+    # 1) латинские буквы-двойники → кириллица (регистр сохраняем): co→со, тоM→тоМ
     if _HAS_CYR.search(w) or _PURE_LAT_SHORT.match(w):
         w2 = "".join(_LAT2CYR.get(ch, ch) for ch in w)
         if not _HAS_LAT.search(w2):     # после замены латиницы не осталось
             w = w2
+    # 2) случайные заглавные OCR (строчных больше заглавных) → строчим; но
+    #    сохраняем возможную легитимную ПЕРВУЮ заглавную (Сбер, Москва, тоМ→том)
+    n_low = sum(1 for c in w if c.islower())
+    n_up  = sum(1 for c in w if c.isupper())
+    if n_up and n_low > n_up:
+        w = (w[0] + w[1:].lower()) if w[0].isupper() else w.lower()
+    # 3) короткое слово со «скачущим» регистром, дающее частый предлог/союз:
+    #    пО→по, cO→сО→со. Белый список защищает единицы (кВ→кв НЕ трогаем).
+    if len(w) <= 3 and w.lower() in _COMMON_SHORT:
+        w = w.lower()
     if w != core and not _is_suspicious(w):
         return w
     return None
@@ -122,8 +135,14 @@ def _is_garbled_cyrillic(core: str) -> bool:
     (и LLM на таком только галлюцинирует, напр. VII→VIII).
     """
     if _ROMAN_RE.match(core):
-        return False
-    return bool(_HAS_CYR.search(core))
+        return False                         # римские цифры (IV, VII) — валидны
+    if _PURE_LAT_SHORT.match(core):
+        return True                          # одиночная латиница (r→г, c→с, ru) — ошибка
+    n_cyr = len(re.findall(rf"[{_CYR}]", core))
+    n_lat = len(re.findall(rf"[{_LAT}]", core))
+    # для смешанных: подсвечиваем, если слово ПРЕИМУЩЕСТВЕННО кириллическое;
+    # латиницы больше → обрывок URL/латинского слова (лnalog) — не подсветка
+    return n_cyr > 0 and n_cyr >= n_lat
 
 
 def _iter_paragraphs(parent):
