@@ -21,6 +21,13 @@ import logging
 import sys
 from pathlib import Path
 
+# Консоль Windows часто в cp1251 — переключаем stdout на UTF-8, иначе логи с
+# символами вроде «→»/«×» сыплют «Logging error» (на саму конвертацию не влияет).
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, ValueError):
+    pass
+
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s  %(levelname)s  %(message)s",

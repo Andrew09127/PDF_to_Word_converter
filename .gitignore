@@ -31,3 +31,9 @@ _render.py
 _dev_*
 _src_*
 _out_*
+_compare_*
+
+# Модель LLM: собранный .gguf НЕ коммитим (>100 МБ, лимит GitHub) —
+# в git лежат куски models/*.gguf.partNNN (<100 МБ), модель склеивается
+# из них автоматически при первом запуске (см. llm_correct._resolve_model).
+models/*.gguf

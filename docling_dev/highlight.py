@@ -110,6 +110,22 @@ def _autofix_word(core: str) -> str | None:
     return None
 
 
+_ROMAN_RE = re.compile(r"^[IVXLCDM]{1,7}$", re.IGNORECASE)
+
+
+def _is_garbled_cyrillic(core: str) -> bool:
+    """Стоит ли подсвечивать слово, которое автофикс НЕ починил.
+
+    Да — если это искажённое РУССКОЕ слово (есть кириллица): человек поправит.
+    Нет — если чисто-латинский токен (URL-обрывок «ru»/«pro», код), римская
+    цифра (IV, VII) или мусор: это не «слово с опечаткой», подсветка только шумит
+    (и LLM на таком только галлюцинирует, напр. VII→VIII).
+    """
+    if _ROMAN_RE.match(core):
+        return False
+    return bool(_HAS_CYR.search(core))
+
+
 def _iter_paragraphs(parent):
     """Все абзацы документа, включая вложенные в ячейки таблиц (рекурсивно)."""
     body = parent.element.body if hasattr(parent, "element") else parent._element
@@ -154,8 +170,10 @@ def _process_run(run) -> tuple[int, int]:
         fixed = _autofix_word(word)
         if fixed is not None:
             segs.append((fixed, False)); n_fix += 1     # очищено — без подсветки
+        elif _is_garbled_cyrillic(word):
+            segs.append((word, True));  n_hl += 1       # искажённое рус. слово — подсветка
         else:
-            segs.append((word, True));  n_hl += 1       # не чинится — подсветка
+            segs.append((word, False))                  # URL-обрывок/римское/код — не трогаем
         pos = e
     if pos < len(text):
         segs.append((text[pos:], False))

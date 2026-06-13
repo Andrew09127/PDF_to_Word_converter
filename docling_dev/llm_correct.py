@@ -15,9 +15,11 @@
 """
 from __future__ import annotations
 
+import glob
 import logging
 import os
 import re
+import shutil
 
 from docx.enum.text import WD_COLOR_INDEX
 
@@ -32,6 +34,8 @@ _DEFAULT_MODEL = os.path.join(
 )
 
 _DIGIT_RE = re.compile(r"\d")
+_HAS_CYR  = re.compile(r"[А-Яа-яЁё]")
+_ROMAN_RE = re.compile(r"^[IVXLCDM]{1,7}$", re.IGNORECASE)
 _SYSTEM = ("Ты исправляешь ошибки распознавания (OCR) в русском юридическом "
            "тексте. В ответе — ТОЛЬКО одно правильное русское слово, без кавычек "
            "и пояснений. Не меняй цифры, номера, ФИО.")
@@ -41,8 +45,29 @@ _llm_failed = False
 
 
 def _resolve_model(model_path: str | None) -> str | None:
+    """Путь к .gguf. Если собранного файла нет, но рядом лежат куски
+    `<имя>.gguf.partNNN` (модель режут на <100 МБ ради лимита GitHub) —
+    склеиваем их один раз в полный файл и далее используем его."""
     p = model_path or _DEFAULT_MODEL
-    return p if os.path.isfile(p) else None
+    if os.path.isfile(p):
+        return p
+    parts = sorted(glob.glob(p + ".part*"))
+    if parts:
+        try:
+            log.info("LLM: собираю модель из %d кусков…", len(parts))
+            with open(p, "wb") as out:
+                for part in parts:
+                    with open(part, "rb") as f:
+                        shutil.copyfileobj(f, out, 1024 * 1024)
+            return p
+        except Exception as exc:
+            log.warning("LLM: не удалось собрать модель из кусков: %s", exc)
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)              # убираем частично записанный файл
+            except OSError:
+                pass
+    return None
 
 
 def llm_available(model_path: str | None = None) -> bool:
@@ -111,6 +136,8 @@ def _accept(orig: str, cand: str | None) -> str | None:
     cand = cand.splitlines()[0].strip().strip("«»\"'.,;:()")
     if not cand or cand == orig:
         return None
+    if _ROMAN_RE.match(orig) or not _HAS_CYR.search(orig):
+        return None                          # римские цифры/коды/латиница — не правим
     if " " in cand or "\t" in cand:          # должно остаться ОДНО слово
         return None
     if _digits(cand) != _digits(orig):       # цифры менять запрещено
