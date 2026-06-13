@@ -2400,6 +2400,8 @@ def convert_pdf(
     ocr_reader=None,
     use_word_order: bool = True,
     highlight: bool = True,
+    llm: bool = False,
+    llm_model: str = "qwen2.5:3b",
 ) -> bool:
     log.info("  Конвертация: %s", pdf_path.name)
     try:
@@ -2429,10 +2431,15 @@ def convert_pdf(
         doc = build_docx(dl_doc, page_sizes, ocr_reader=ocr_reader,
                          use_word_order=effective_word_order)
         if highlight:
-            # Подсветка подозрительных (вероятно искажённых OCR) слов — текст не
-            # меняется, только жёлтый фон для быстрой ручной вычитки.
+            # Автоочистка детерминируемых OCR-ошибок в помеченных словах +
+            # подсветка остатка жёлтым (для быстрой ручной вычитки).
             from .highlight import highlight_suspicious
             highlight_suspicious(doc)
+            if llm:
+                # Опц. шаг 2: локальная LLM добивает оставшиеся подсвеченные слова
+                # (только их, не весь документ). No-op, если Ollama не запущена.
+                from .llm_correct import correct_highlighted
+                correct_highlighted(doc, llm_model)
         doc.save(str(docx_path))
         log.info("  ✓ %s", docx_path.name)
         return True
@@ -2450,6 +2457,8 @@ class DoclingBatchConverter:
         langs: list[str] | None = None,
         use_word_order: bool = True,
         highlight: bool = True,
+        llm: bool = False,
+        llm_model: str = "qwen2.5:3b",
     ) -> None:
         self.input_folder   = Path(input_folder)
         self.output_folder  = Path(output_folder)
@@ -2457,6 +2466,8 @@ class DoclingBatchConverter:
         self.langs          = langs or ["ru", "en"]
         self.use_word_order = use_word_order
         self.highlight      = highlight
+        self.llm            = llm
+        self.llm_model      = llm_model
         self.output_folder.mkdir(parents=True, exist_ok=True)
         if self.backup_folder:
             self.backup_folder.mkdir(parents=True, exist_ok=True)
@@ -2501,7 +2512,8 @@ class DoclingBatchConverter:
             ok = convert_pdf(pdf_path, docx_path, self.converter,
                              ocr_reader=self.ocr_reader,
                              use_word_order=self.use_word_order,
-                             highlight=self.highlight)
+                             highlight=self.highlight,
+                             llm=self.llm, llm_model=self.llm_model)
             if ok:
                 stats["ok"] += 1
                 if self.backup_folder and move_to_backup:
