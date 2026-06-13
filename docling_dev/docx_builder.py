@@ -87,7 +87,10 @@ def detect_alignment(bbox, page_width: float) -> WD_ALIGN_PARAGRAPH:
         return WD_ALIGN_PARAGRAPH.JUSTIFY
     if abs(cx - page_width / 2) < page_width * 0.08 and ratio < 0.68:
         return WD_ALIGN_PARAGRAPH.CENTER
-    if x0 > page_width * 0.12 and x1 > page_width * 0.72 and ratio < 0.82:
+    # RIGHT только для КОРОТКИХ блоков, реально прижатых к правому краю
+    # (дата, подпись, номер). Длинный текст в правой колонке (адреса, реквизиты) —
+    # это ЛЕВОЕ чтение в колонке: делаем LEFT, позицию задаёт left_indent.
+    if x0 > page_width * 0.12 and x1 > page_width * 0.72 and ratio < 0.45:
         return WD_ALIGN_PARAGRAPH.RIGHT
     return WD_ALIGN_PARAGRAPH.LEFT
 

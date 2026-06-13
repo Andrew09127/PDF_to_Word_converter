@@ -1813,11 +1813,15 @@ def build_docx(
             prev_midY[page_no] = bbox_mid_y(bbox)
             prev_h[page_no]    = item_h
 
+        # Левый отступ блока относительно левого края контента страницы.
+        # Раньше отступ > 25% ширины обнулялся — глубоко сдвинутые блоки теряли
+        # позицию. Теперь сохраняем отступ почти как в PDF: порог шума 4pt
+        # (мелкий сдвиг bbox игнорируем), верхний предел 45% ширины (защита от мусора).
         indent_pt = 0.0
         if bbox is not None:
             raw_indent = float(getattr(bbox, "l", 0)) - page_left_min.get(page_no, 0.0)
-            if 0 < raw_indent < pw * 0.25:
-                indent_pt = round(raw_indent, 1)
+            if raw_indent >= 4.0:
+                indent_pt = round(min(raw_indent, pw * 0.45), 1)
 
         alignment = (
             detect_alignment(bbox, pw)
@@ -1837,10 +1841,15 @@ def build_docx(
             elif alignment == WD_ALIGN_PARAGRAPH.RIGHT and raw_x0 < pw * 0.30:
                 alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
 
+        # Жирный/курсив: берём из Docling formatting если есть (точно для PDF с
+        # текстовым слоем), иначе — эвристика. Для сканов formatting пуст → эвристика.
+        _fmt      = getattr(item, "formatting", None)
+        _fmt_bold = bool(getattr(_fmt, "bold", False))   if _fmt is not None else False
+        _fmt_ital = bool(getattr(_fmt, "italic", False)) if _fmt is not None else False
         _alpha       = [c for c in text if c.isalpha()]
         _is_all_caps = bool(_alpha) and all(c.isupper() for c in _alpha) and len(text.strip()) <= 60
-        bold   = lbl in ("title", "section_header") or _is_all_caps or _gosposhlina_bold
-        italic = lbl in ("caption", "footnote")
+        bold   = _fmt_bold or lbl in ("title", "section_header") or _is_all_caps or _gosposhlina_bold
+        italic = _fmt_ital or lbl in ("caption", "footnote")
 
         # Предупреждение при нетипичном размере шрифта
         if font_pt < 8.0:
@@ -2306,7 +2315,12 @@ def build_docx(
                 para.paragraph_format.left_indent       = Pt(max(_gp_x0 - _gp_lm, 0.0))
             else:
                 para.paragraph_format.first_line_indent = Pt(0)
-                para.paragraph_format.left_indent       = Pt(indent_pt)
+                # left_indent применяем ТОЛЬКО к LEFT/JUSTIFY: для RIGHT/CENTER
+                # позицию задаёт выравнивание, добавочный отступ уводит текст вбок.
+                if alignment in (WD_ALIGN_PARAGRAPH.LEFT, WD_ALIGN_PARAGRAPH.JUSTIFY):
+                    para.paragraph_format.left_indent = Pt(indent_pt)
+                else:
+                    para.paragraph_format.left_indent = Pt(0)
 
             run           = para.add_run(text)
             run.font.name = FONT_NAME

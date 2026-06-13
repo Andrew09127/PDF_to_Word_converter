@@ -41,6 +41,9 @@ _OCR_CHAR_FIXES: list[tuple[re.Pattern, str]] = [
     (re.compile(r'\bN[o°о]\.?\s*(?=\d)'),                                    '№ '),
     (re.compile(r'\bNg\.?\s*(?=\d)'),                                        '№ '),
     (re.compile(r'\bN[go°о]\.?\s+(?=[А-ЯЁA-Z]\d)'),                         '№ '),
+    # «Ngl» → «№ 1» (l — это «1»); «Ng1»/«Ng2» → «№ 1»/«№ 2» (слитно с цифрой)
+    (re.compile(r'\bNgl\b'),                                                  '№ 1'),
+    (re.compile(r'\bNg(\d)'),                                                r'№ \1'),
     # «Ng» как отдельный токен (за ним код из букв: «Ng SRSRS50…») → «№».
     # В русском «Ng» не встречается как слово, поэтому замена изолированного токена безопасна.
     (re.compile(r'\bNg\b'),                                                   '№'),
