@@ -80,6 +80,36 @@ def suspicious_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
+# Латиница → кириллица (визуальные двойники) — для очистки гомоглифов
+_LAT2CYR = {
+    "a": "а", "c": "с", "e": "е", "o": "о", "p": "р", "x": "х", "y": "у",
+    "A": "А", "B": "В", "C": "С", "E": "Е", "H": "Н", "K": "К", "M": "М",
+    "O": "О", "P": "Р", "T": "Т", "X": "Х", "Y": "У",
+}
+
+
+def _autofix_word(core: str) -> str | None:
+    """Пытается ДЕТЕРМИНИРОВАННО починить подозрительное слово.
+
+    1) случайные заглавные OCR (если строчных больше заглавных) → строчим;
+    2) латинские буквы-двойники → кириллица (co→со, B→В, OOО→ООО, КB→КВ).
+    Возвращает исправленное слово, если оно стало «чистым» (не подозрительным),
+    иначе None (оставляем подсветку).
+    """
+    w = core
+    n_low = sum(1 for c in w if c.islower())
+    n_up  = sum(1 for c in w if c.isupper())
+    if n_up and n_low > n_up:           # слово в нижнем регистре со «скачущими» CAPS
+        w = w.lower()
+    if _HAS_CYR.search(w) or _PURE_LAT_SHORT.match(w):
+        w2 = "".join(_LAT2CYR.get(ch, ch) for ch in w)
+        if not _HAS_LAT.search(w2):     # после замены латиницы не осталось
+            w = w2
+    if w != core and not _is_suspicious(w):
+        return w
+    return None
+
+
 def _iter_paragraphs(parent):
     """Все абзацы документа, включая вложенные в ячейки таблиц (рекурсивно)."""
     body = parent.element.body if hasattr(parent, "element") else parent._element
@@ -98,18 +128,6 @@ def _iter_in(element, doc):
                     yield from _iter_in(cell._tc, doc)
 
 
-def _segments(text: str, spans: list[tuple[int, int]]):
-    segs, pos = [], 0
-    for s, e in spans:
-        if s > pos:
-            segs.append((text[pos:s], False))
-        segs.append((text[s:e], True))
-        pos = e
-    if pos < len(text):
-        segs.append((text[pos:], False))
-    return segs
-
-
 def _has_complex_content(r) -> bool:
     """True если run содержит не только текст (переносы, картинки и т.п.)."""
     for ch in r.iterchildren():
@@ -119,33 +137,54 @@ def _has_complex_content(r) -> bool:
     return False
 
 
-def _highlight_run(run) -> int:
+def _process_run(run) -> tuple[int, int]:
+    """Для каждого подозрительного слова: либо ДЕТЕРМИНИРОВАННО чиним (без
+    подсветки), либо подсвечиваем жёлтым (если автопочинить нельзя).
+    Возвращает (подсвечено, исправлено)."""
     spans = suspicious_spans(run.text)
     if not spans or _has_complex_content(run._r):
-        return 0
-    segs = _segments(run.text, spans)
+        return (0, 0)
+    text = run.text
+    segs: list[tuple[str, bool]] = []   # (текст, подсвечивать?)
+    pos, n_hl, n_fix = 0, 0, 0
+    for s, e in spans:
+        if s > pos:
+            segs.append((text[pos:s], False))
+        word  = text[s:e]
+        fixed = _autofix_word(word)
+        if fixed is not None:
+            segs.append((fixed, False)); n_fix += 1     # очищено — без подсветки
+        else:
+            segs.append((word, True));  n_hl += 1       # не чинится — подсветка
+        pos = e
+    if pos < len(text):
+        segs.append((text[pos:], False))
+
     orig_r = copy.deepcopy(run._r)          # шаблон форматирования
     run.text = segs[0][0]
     run.font.highlight_color = WD_COLOR_INDEX.YELLOW if segs[0][1] else None
     anchor = run._r
-    for seg_text, susp in segs[1:]:
+    for seg_text, hl in segs[1:]:
         new_r = copy.deepcopy(orig_r)
         anchor.addnext(new_r)
         nr = Run(new_r, run._parent)
         nr.text = seg_text
-        nr.font.highlight_color = WD_COLOR_INDEX.YELLOW if susp else None
+        nr.font.highlight_color = WD_COLOR_INDEX.YELLOW if hl else None
         anchor = new_r
-    return sum(1 for _, s in segs if s)
+    return (n_hl, n_fix)
 
 
 def highlight_suspicious(doc) -> int:
-    """Подсвечивает жёлтым все подозрительные слова в документе. Возвращает счётчик."""
-    n = 0
+    """Чистит детерминируемые OCR-ошибки в помеченных словах и подсвечивает
+    остаток жёлтым. Возвращает число подсвеченных (оставшихся) фрагментов."""
+    n_hl = n_fix = 0
     for para in _iter_paragraphs(doc):
         for run in list(para.runs):
             try:
-                n += _highlight_run(run)
+                hl, fix = _process_run(run)
+                n_hl += hl; n_fix += fix
             except Exception as exc:               # один run не должен ломать документ
                 log.debug("highlight: пропуск run: %s", exc)
-    log.info("highlight: помечено %d подозрительных фрагментов", n)
-    return n
+    log.info("highlight: исправлено %d, подсвечено %d (осталось) фрагментов",
+             n_fix, n_hl)
+    return n_hl

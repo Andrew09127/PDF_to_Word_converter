@@ -674,4 +674,27 @@ def apply_legal_fixes(all_items: list) -> tuple[list, set]:
                     result[off] = (_RenumberItem(result[off][0], num), result[off][1])
                 log.info("fix_order: приложения отсортированы (%d пунктов перенумерованы)", num)
 
+    # Fix 9: склейка оторванного имени организации. OCR разрезает строку
+    # «Получатель: АО «АЛЬФА-БАНК»» на два блока: «…АО» и «АЛЬФА-БАНК»». Если блок
+    # оканчивается голой орг.-формой (АО/ПАО/ООО/ОАО/ЗАО), а следующий — короткое
+    # ЗАГЛАВНОЕ имя, приклеиваем имя в кавычках к предыдущему блоку.
+    # [ОO] — кириллическая или ЛАТИНСКАЯ O (OCR на сыром тексте даёт «АO»).
+    _ORGFORM_END_RE = re.compile(r'\b(?:А|ПА|ОО|ОА|ЗА)[ОO]\s*$')
+    _ORGNAME_ONLY_RE = re.compile(
+        r'^\s*[«"(<]?\s*([А-ЯЁ][А-ЯЁ0-9\-]+(?:\s+[А-ЯЁ0-9\-]+)?)\s*[»"эжх)>]?\s*$')
+    _i = 0
+    while _i < len(result) - 1:
+        if (_lbl(_i) in _PROSIT_LBLS and _lbl(_i + 1) in _PROSIT_LBLS
+                and _pg(_i) == _pg(_i + 1)
+                and _ORGFORM_END_RE.search(_txt(_i))):
+            _m = _ORGNAME_ONLY_RE.match(_txt(_i + 1))
+            if _m:
+                _name = _m.group(1).strip()
+                result[_i] = (_TextAppendItem(result[_i][0], f' «{_name}»'),
+                              result[_i][1])
+                result.pop(_i + 1)
+                log.info("fix_order: склейка орг-имени → «%s»", _name)
+                continue
+        _i += 1
+
     return result, continuation_ids
