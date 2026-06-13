@@ -1103,6 +1103,13 @@ def _render_native_two_column_header(
 # Детектор «Госпошлина» для склейки соседнего bbox суммы
 _GOSPOSHLINA_RE = re.compile(r'^Госпошлин', re.IGNORECASE)
 
+# Реквизитные строки — всегда выравниваются по левому краю (это маркированные
+# данные банка/получателя, а не право-/центро-выключенный текст).
+_REQ_LABEL_RE = re.compile(
+    r'^\s*(Р\s*/\s*с|Р\s*/\s*сч|К\s*/\s*с|Кор\s*/\s*сч|ИНН|КПП|БИК|ОГРН|ОКПО|'
+    r'Получатель|Расч[её]тный\s+счет|Корреспондентский\s+счет)\b',
+    re.IGNORECASE)
+
 # Маркер начала штампа электронной подписи
 _ES_STAMP_MARKER_RE = re.compile(
     r'Электронн\w*\s+подпис\w*\s+действительн', re.IGNORECASE)
@@ -1840,12 +1847,21 @@ def build_docx(
                 alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             elif alignment == WD_ALIGN_PARAGRAPH.RIGHT and raw_x0 < pw * 0.30:
                 alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            # ДЛИННЫЙ «правый» блок — это колоночный текст (адрес, реквизиты),
+            # читаемый слева направо, а не реально правовыключенный (даты/подписи
+            # коротки). Делаем LEFT — позицию задаст left_indent (отступ колонки).
+            elif alignment == WD_ALIGN_PARAGRAPH.RIGHT and len(text) > 60:
+                alignment = WD_ALIGN_PARAGRAPH.LEFT
             # Длинный абзац У ЛЕВОГО ПОЛЯ (indent≈0) — это тело документа:
             # делаем выключку по ширине (даст и красную строку). НЕ трогаем
             # колоночный текст (адреса/реквизиты с отступом) — у него indent>10.
             elif (alignment == WD_ALIGN_PARAGRAPH.LEFT
                   and len(text) > 80 and indent_pt < 10.0):
                 alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            # Реквизитные строки (Р/с, ИНН, КПП, Кор/сч, БИК, Получатель, ОГРН) —
+            # всегда LEFT (маркированные данные). Применяем последним как override.
+            if _REQ_LABEL_RE.match(text):
+                alignment = WD_ALIGN_PARAGRAPH.LEFT
 
         # Жирный/курсив: берём из Docling formatting если есть (точно для PDF с
         # текстовым слоем), иначе — эвристика. Для сканов formatting пуст → эвристика.

@@ -105,8 +105,10 @@ def main() -> None:
         help="Куда перемещать PDF после конвертации (по умолч. ./pdf_backup/)"
     )
     parser.add_argument(
-        "--no-word-order", action="store_true",
-        help="Отключить автоматическое исправление порядка блоков через EasyOCR"
+        "--word-order", action="store_true",
+        help="Включить EasyOCR-переупорядочивание блоков. По умолчанию ВЫКЛ: "
+             "нативный порядок Docling точнее и не ломает вёрстку (штамп ЭП, "
+             "реквизиты, колоночные блоки)."
     )
     parser.add_argument(
         "--no-highlight", action="store_true",
@@ -114,7 +116,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    use_word_order = not args.no_word_order
+    use_word_order = args.word_order
     highlight      = not args.no_highlight
 
     if args.pdf:
