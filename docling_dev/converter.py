@@ -1858,6 +1858,14 @@ def build_docx(
             elif (alignment == WD_ALIGN_PARAGRAPH.LEFT
                   and len(text) > 80 and indent_pt < 10.0):
                 alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            # Короткая строка в ПРАВОЙ КОЛОНКЕ (большой левый отступ), которую
+            # detect_alignment принял за CENTER/RIGHT — на деле левовыключенная
+            # строка колонки-шапки заявления (Кредитор:/Должник:/email и т.п.).
+            # Возвращаем LEFT, чтобы применился отступ колонки и строка встала в
+            # один край с длинными соседями того же блока (иначе уезжает к центру).
+            if (alignment in (WD_ALIGN_PARAGRAPH.CENTER, WD_ALIGN_PARAGRAPH.RIGHT)
+                    and indent_pt > pw * 0.18):
+                alignment = WD_ALIGN_PARAGRAPH.LEFT
             # Реквизитные строки (Р/с, ИНН, КПП, Кор/сч, БИК, Получатель, ОГРН) —
             # всегда LEFT (маркированные данные). Применяем последним как override.
             if _REQ_LABEL_RE.match(text):
@@ -2102,7 +2110,16 @@ def build_docx(
             # Heading-блоки в правой части страницы (x0 > 42% ширины) получают
             # left_indent чтобы совпасть с правой колонкой label:content таблиц.
             _h_lm = page_left_min.get(page_no, 0.0)
-            if alignment == WD_ALIGN_PARAGRAPH.RIGHT and _h_x0 > pw * 0.42:
+            # Метки-заголовки правой КОЛОНКИ-ШАПКИ заявления (Кредитор:/Должник:/
+            # Финансовый управляющий:) — кончаются на «:» и стоят в правой части.
+            # Выравниваем ПО ЛЕВому краю колонки с тем же отступом, что и текстовые
+            # соседи блока (иначе section_header центрируется/уезжает к левому полю).
+            # Заголовки без «:» (ЗАЯВЛЕНИЕ, «Арбитражный суд…») сюда НЕ попадают.
+            if text.rstrip().endswith(":") and _h_x0 > pw * 0.42:
+                alignment = WD_ALIGN_PARAGRAPH.LEFT
+                para.alignment = alignment
+                para.paragraph_format.left_indent = Pt(max(_h_x0 - _h_lm, 0.0))
+            elif alignment == WD_ALIGN_PARAGRAPH.RIGHT and _h_x0 > pw * 0.42:
                 _h_indent_in = max((_h_x0 - _h_lm) / 72, 0.0)
                 para.paragraph_format.left_indent = Pt(_h_indent_in * 72)
             else:
