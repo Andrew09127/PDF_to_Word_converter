@@ -54,7 +54,8 @@ def _init_ocr_reader(langs: list[str]) -> object | None:
         return None
 
 
-def _convert_single(pdf_path: Path, out_dir: Path, use_word_order: bool) -> None:
+def _convert_single(pdf_path: Path, out_dir: Path, use_word_order: bool,
+                    highlight: bool = True) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     docx_path = out_dir / f"{pdf_path.stem}.docx"
     logging.info("Один файл: %s", pdf_path.name)
@@ -63,7 +64,8 @@ def _convert_single(pdf_path: Path, out_dir: Path, use_word_order: bool) -> None
     ocr_reader = _init_ocr_reader(["ru", "en"]) if use_word_order else None
 
     ok = convert_pdf(pdf_path, docx_path, converter,
-                     ocr_reader=ocr_reader, use_word_order=use_word_order)
+                     ocr_reader=ocr_reader, use_word_order=use_word_order,
+                     highlight=highlight)
     if ok:
         logging.info("Готово: %s", docx_path)
     else:
@@ -72,12 +74,13 @@ def _convert_single(pdf_path: Path, out_dir: Path, use_word_order: bool) -> None
 
 
 def _convert_batch(input_dir: Path, output_dir: Path, backup_dir: Path,
-                   use_word_order: bool) -> None:
+                   use_word_order: bool, highlight: bool = True) -> None:
     DoclingBatchConverter(
         input_folder=str(input_dir),
         output_folder=str(output_dir),
         backup_folder=str(backup_dir),
         use_word_order=use_word_order,
+        highlight=highlight,
     ).process()
 
 
@@ -105,15 +108,20 @@ def main() -> None:
         "--no-word-order", action="store_true",
         help="Отключить автоматическое исправление порядка блоков через EasyOCR"
     )
+    parser.add_argument(
+        "--no-highlight", action="store_true",
+        help="Не подсвечивать жёлтым подозрительные (вероятно искажённые OCR) слова"
+    )
     args = parser.parse_args()
 
     use_word_order = not args.no_word_order
+    highlight      = not args.no_highlight
 
     if args.pdf:
         if not args.pdf.is_file():
             logging.error("Файл не найден: %s", args.pdf)
             sys.exit(1)
-        _convert_single(args.pdf, args.output, use_word_order)
+        _convert_single(args.pdf, args.output, use_word_order, highlight)
     else:
         if not args.input.is_dir():
             logging.error(
@@ -121,7 +129,7 @@ def main() -> None:
                 "Создайте её или укажите --input /путь/к/папке", args.input
             )
             sys.exit(1)
-        _convert_batch(args.input, args.output, args.backup, use_word_order)
+        _convert_batch(args.input, args.output, args.backup, use_word_order, highlight)
 
 
 if __name__ == "__main__":

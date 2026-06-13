@@ -2366,6 +2366,7 @@ def convert_pdf(
     converter,
     ocr_reader=None,
     use_word_order: bool = True,
+    highlight: bool = True,
 ) -> bool:
     log.info("  Конвертация: %s", pdf_path.name)
     try:
@@ -2394,6 +2395,11 @@ def convert_pdf(
 
         doc = build_docx(dl_doc, page_sizes, ocr_reader=ocr_reader,
                          use_word_order=effective_word_order)
+        if highlight:
+            # Подсветка подозрительных (вероятно искажённых OCR) слов — текст не
+            # меняется, только жёлтый фон для быстрой ручной вычитки.
+            from .highlight import highlight_suspicious
+            highlight_suspicious(doc)
         doc.save(str(docx_path))
         log.info("  ✓ %s", docx_path.name)
         return True
@@ -2410,12 +2416,14 @@ class DoclingBatchConverter:
         backup_folder: str | None = None,
         langs: list[str] | None = None,
         use_word_order: bool = True,
+        highlight: bool = True,
     ) -> None:
         self.input_folder   = Path(input_folder)
         self.output_folder  = Path(output_folder)
         self.backup_folder  = Path(backup_folder) if backup_folder else None
         self.langs          = langs or ["ru", "en"]
         self.use_word_order = use_word_order
+        self.highlight      = highlight
         self.output_folder.mkdir(parents=True, exist_ok=True)
         if self.backup_folder:
             self.backup_folder.mkdir(parents=True, exist_ok=True)
@@ -2459,7 +2467,8 @@ class DoclingBatchConverter:
                      pdf_path.stat().st_size / 1_048_576)
             ok = convert_pdf(pdf_path, docx_path, self.converter,
                              ocr_reader=self.ocr_reader,
-                             use_word_order=self.use_word_order)
+                             use_word_order=self.use_word_order,
+                             highlight=self.highlight)
             if ok:
                 stats["ok"] += 1
                 if self.backup_folder and move_to_backup:
