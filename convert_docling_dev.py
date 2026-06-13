@@ -56,7 +56,7 @@ def _init_ocr_reader(langs: list[str]) -> object | None:
 
 def _convert_single(pdf_path: Path, out_dir: Path, use_word_order: bool,
                     highlight: bool = True, llm: bool = False,
-                    llm_model: str = "qwen2.5:3b") -> None:
+                    llm_model: str = "") -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     docx_path = out_dir / f"{pdf_path.stem}.docx"
     logging.info("Один файл: %s", pdf_path.name)
@@ -76,7 +76,7 @@ def _convert_single(pdf_path: Path, out_dir: Path, use_word_order: bool,
 
 def _convert_batch(input_dir: Path, output_dir: Path, backup_dir: Path,
                    use_word_order: bool, highlight: bool = True,
-                   llm: bool = False, llm_model: str = "qwen2.5:3b") -> None:
+                   llm: bool = False, llm_model: str = "") -> None:
     DoclingBatchConverter(
         input_folder=str(input_dir),
         output_folder=str(output_dir),
@@ -120,12 +120,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--llm", action="store_true",
-        help="Локальная LLM (Ollama) добивает оставшиеся подсвеченные слова. "
-             "Полностью локально; если Ollama не запущена — шаг пропускается."
+        help="Локальная LLM (llama-cpp-python + .gguf, в процессе) добивает "
+             "оставшиеся подсвеченные слова. Полностью локально, без отдельных "
+             "программ; если пакета/модели нет — шаг пропускается."
     )
     parser.add_argument(
-        "--llm-model", default="qwen2.5:3b",
-        help="Имя локальной модели Ollama для доочистки (по умолч. qwen2.5:3b)"
+        "--llm-model", default="",
+        help="Путь к .gguf-модели для доочистки (по умолч. вендоренная в models/)"
     )
     args = parser.parse_args()
 

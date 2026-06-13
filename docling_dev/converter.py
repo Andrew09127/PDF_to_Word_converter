@@ -2401,7 +2401,7 @@ def convert_pdf(
     use_word_order: bool = True,
     highlight: bool = True,
     llm: bool = False,
-    llm_model: str = "qwen2.5:3b",
+    llm_model: str = "",
 ) -> bool:
     log.info("  Конвертация: %s", pdf_path.name)
     try:
@@ -2436,10 +2436,11 @@ def convert_pdf(
             from .highlight import highlight_suspicious
             highlight_suspicious(doc)
             if llm:
-                # Опц. шаг 2: локальная LLM добивает оставшиеся подсвеченные слова
-                # (только их, не весь документ). No-op, если Ollama не запущена.
+                # Опц. шаг 2: локальная LLM (llama-cpp-python + .gguf, в процессе)
+                # добивает оставшиеся подсвеченные слова — только их, не весь
+                # документ. No-op, если пакета/модели нет.
                 from .llm_correct import correct_highlighted
-                correct_highlighted(doc, llm_model)
+                correct_highlighted(doc, llm_model or None)
         doc.save(str(docx_path))
         log.info("  ✓ %s", docx_path.name)
         return True
@@ -2458,7 +2459,7 @@ class DoclingBatchConverter:
         use_word_order: bool = True,
         highlight: bool = True,
         llm: bool = False,
-        llm_model: str = "qwen2.5:3b",
+        llm_model: str = "",
     ) -> None:
         self.input_folder   = Path(input_folder)
         self.output_folder  = Path(output_folder)

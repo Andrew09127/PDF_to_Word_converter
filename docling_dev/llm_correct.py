@@ -1,22 +1,23 @@
 """Локальная LLM-доочистка подсвеченных (не исправленных детерминированно) слов.
 
-ПОЛНОСТЬЮ ЛОКАЛЬНО и ОПЦИОНАЛЬНО:
-  • обращение к Ollama по HTTP на localhost:11434 — наружу ничего не уходит;
-  • без новых pip-зависимостей (только стандартная библиотека urllib/json);
-  • если Ollama не установлена/не запущена — модуль ничего не делает (no-op),
-    программа продолжает работать как обычно (автоочистка + подсветка).
+ПОЛНОСТЬЮ ЛОКАЛЬНО, БЕЗ ОТДЕЛЬНЫХ ПРОГРАММ:
+  • движок — pip-пакет `llama-cpp-python` (вендорится в git, как torch);
+  • модель — файл `.gguf` в папке `models/` (тоже в git);
+  • инференс идёт В САМОМ процессе Python — ни сети, ни службы, ни установки
+    на целевом ПК (работает в закрытой корпоративной сети офлайн).
+  • ОПЦИОНАЛЬНО: если пакета или файла модели нет — модуль ничего не делает
+    (no-op), программа продолжает работать как обычно (автоочистка + подсветка).
 
 Обрабатываются ТОЛЬКО уже подсвеченные жёлтым слова (остаток после
 детерминированной автоочистки) — это ~10 коротких фрагментов на документ,
 поэтому быстро даже на CPU. Жёсткие предохранители не дают модели менять
-цифры/номера и «галлюцинировать» длинные фразы.
+цифры/номера и «галлюцинировать» (подменять слово другим).
 """
 from __future__ import annotations
 
-import json
 import logging
+import os
 import re
-import urllib.request
 
 from docx.enum.text import WD_COLOR_INDEX
 
@@ -24,44 +25,63 @@ from .highlight import _iter_paragraphs
 
 log = logging.getLogger(__name__)
 
-_BASE      = "http://localhost:11434"
-_TAGS_URL  = _BASE + "/api/tags"
-_GEN_URL   = _BASE + "/api/generate"
-_DIGIT_RE  = re.compile(r"\d")
-_DEFAULT_MODEL = "qwen2.5:3b"
-
-_PROMPT = (
-    "Ты исправляешь ошибки распознавания (OCR) в русском юридическом тексте.\n"
-    "В предложении одно слово распознано неверно (смешаны латиница/кириллица, "
-    "случайные заглавные и т.п.).\n"
-    "Предложение: «{ctx}»\n"
-    "Искажённое слово: «{word}»\n"
-    "Верни ТОЛЬКО одно правильное русское слово — без кавычек, без пояснений. "
-    "НЕ меняй цифры, номера, ФИО. Если слово уже верное — верни его без изменений."
+# Модель по умолчанию — вендоренный .gguf в папке models/ рядом с проектом.
+_DEFAULT_MODEL = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "models", "qwen2.5-1.5b-instruct-q4_k_m.gguf",
 )
 
+_DIGIT_RE = re.compile(r"\d")
+_SYSTEM = ("Ты исправляешь ошибки распознавания (OCR) в русском юридическом "
+           "тексте. В ответе — ТОЛЬКО одно правильное русское слово, без кавычек "
+           "и пояснений. Не меняй цифры, номера, ФИО.")
 
-def ollama_available(timeout: float = 2.0) -> bool:
-    """True если локальный сервер Ollama отвечает."""
+_llm = None          # ленивый singleton модели (грузим один раз на весь батч)
+_llm_failed = False
+
+
+def _resolve_model(model_path: str | None) -> str | None:
+    p = model_path or _DEFAULT_MODEL
+    return p if os.path.isfile(p) else None
+
+
+def llm_available(model_path: str | None = None) -> bool:
+    """True если есть и пакет llama-cpp-python, и файл модели."""
+    if _resolve_model(model_path) is None:
+        return False
     try:
-        urllib.request.urlopen(_TAGS_URL, timeout=timeout)
+        import llama_cpp  # noqa: F401
         return True
     except Exception:
         return False
 
 
-def _ask(word: str, ctx: str, model: str, timeout: float = 60.0) -> str | None:
-    payload = json.dumps({
-        "model": model,
-        "prompt": _PROMPT.format(ctx=ctx[:400], word=word),
-        "stream": False,
-        "options": {"temperature": 0.0, "num_predict": 16},
-    }).encode("utf-8")
+def _get_llm(model_path: str):
+    global _llm, _llm_failed
+    if _llm is None and not _llm_failed:
+        try:
+            from llama_cpp import Llama
+            _llm = Llama(model_path=model_path, n_ctx=512,
+                         n_threads=os.cpu_count() or 4, verbose=False)
+            log.info("LLM: модель загружена (%s)", os.path.basename(model_path))
+        except Exception as exc:
+            _llm_failed = True
+            log.warning("LLM: не удалось загрузить модель: %s", exc)
+    return _llm
+
+
+def _ask(llm, word: str, ctx: str) -> str | None:
     try:
-        req = urllib.request.Request(
-            _GEN_URL, data=payload, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return (json.loads(r.read().decode("utf-8")).get("response") or "").strip()
+        out = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": _SYSTEM},
+                {"role": "user", "content":
+                    f"Предложение: «{ctx[:400]}»\n"
+                    f"Искажённое слово: «{word}»\nПравильное слово:"},
+            ],
+            temperature=0.0, max_tokens=16,
+        )
+        return (out["choices"][0]["message"]["content"] or "").strip()
     except Exception as exc:
         log.debug("LLM: запрос не удался: %s", exc)
         return None
@@ -96,17 +116,21 @@ def _accept(orig: str, cand: str | None) -> str | None:
     if _digits(cand) != _digits(orig):       # цифры менять запрещено
         return None
     # Правка должна быть МЕЛКОЙ (починка OCR), а не подмена другим словом.
-    # Иначе модель «галлюцинирует» (пО → пОТОМУ). Порог растёт с длиной слова.
     if _edit_distance(orig.lower(), cand.lower()) > max(2, len(orig) // 3):
         return None
     return cand
 
 
-def correct_highlighted(doc, model: str = _DEFAULT_MODEL) -> int:
-    """Прогоняет подсвеченные слова через локальную LLM; что удалось безопасно
+def correct_highlighted(doc, model_path: str | None = None) -> int:
+    """Прогоняет подсвеченные слова через локальную модель; что удалось безопасно
     исправить — заменяет и снимает подсветку. Возвращает число исправленных."""
-    if not ollama_available():
-        log.info("LLM-доочистка: Ollama недоступна (localhost:11434) — пропуск")
+    resolved = _resolve_model(model_path)
+    if resolved is None:
+        log.info("LLM-доочистка: модель не найдена (%s) — пропуск",
+                 model_path or _DEFAULT_MODEL)
+        return 0
+    llm = _get_llm(resolved)
+    if llm is None:
         return 0
     fixed = 0
     for para in _iter_paragraphs(doc):
@@ -117,7 +141,7 @@ def correct_highlighted(doc, model: str = _DEFAULT_MODEL) -> int:
             word = run.text.strip()
             if not word:
                 continue
-            cand = _accept(word, _ask(word, ctx, model))
+            cand = _accept(word, _ask(llm, word, ctx))
             if cand:
                 run.text = run.text.replace(word, cand)
                 run.font.highlight_color = None
