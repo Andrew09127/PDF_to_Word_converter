@@ -10,6 +10,7 @@ import statistics
 from io import BytesIO
 
 from docx import Document
+from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -477,9 +478,11 @@ def add_es_stamp(doc: Document, lines: list[str], width_inch: float) -> None:
     lines = [ln for ln in (l.strip() for l in lines) if ln]
     if not lines:
         return
-    box_w = max(min(width_inch * 0.62, width_inch), 2.0)
+    box_w = max(min(width_inch * 0.55, width_inch), 2.0)
     tbl = doc.add_table(rows=1, cols=1)
     tbl.style = "Normal Table"
+    # Штамп ЭП в оригинале — справа внизу: выравниваем рамку по правому краю.
+    tbl.alignment = WD_TABLE_ALIGNMENT.RIGHT
     # Фиксированная раскладка + явная ширина
     tbl_el = tbl._tbl
     tbl_pr = tbl_el.find(qn("w:tblPr"))

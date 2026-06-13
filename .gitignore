@@ -23,3 +23,11 @@ env/
 .vscode/
 .claude/
 
+
+# dev-инструменты вёрстки (не коммитим)
+_cache/
+_dev.py
+_render.py
+_dev_*
+_src_*
+_out_*

@@ -1840,6 +1840,12 @@ def build_docx(
                 alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             elif alignment == WD_ALIGN_PARAGRAPH.RIGHT and raw_x0 < pw * 0.30:
                 alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            # Длинный абзац У ЛЕВОГО ПОЛЯ (indent≈0) — это тело документа:
+            # делаем выключку по ширине (даст и красную строку). НЕ трогаем
+            # колоночный текст (адреса/реквизиты с отступом) — у него indent>10.
+            elif (alignment == WD_ALIGN_PARAGRAPH.LEFT
+                  and len(text) > 80 and indent_pt < 10.0):
+                alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
 
         # Жирный/курсив: берём из Docling formatting если есть (точно для PDF с
         # текстовым слоем), иначе — эвристика. Для сканов formatting пуст → эвристика.
@@ -2294,15 +2300,12 @@ def build_docx(
             para.paragraph_format.space_after   = Pt(0)
             para.paragraph_format.widow_control = False
 
-            # Красная строка: paragraph/text с JUSTIFY-выравниванием.
-            # indent_pt < 8  — блок у левого поля → красная строка.
-            # 20 < indent_pt < 50 — OCR bbox захватил первую строку с отступом
-            #   (Docling даёт l-координату ПЕРВОГО символа = начало красной строки).
-            #   В этом случае bbox.l ≈ 70pt + 35pt = 105pt → indent_pt ≈ 35pt.
+            # Красная строка: ВСЕ полноширинные (JUSTIFY) абзацы тела получают
+            # first-line indent — как в исходном юр-документе (у каждого абзаца
+            # красная строка). left_indent тут не нужен (текст на всю ширину).
             _is_red_line = (
                 lbl in ("paragraph", "text")
                 and alignment == WD_ALIGN_PARAGRAPH.JUSTIFY
-                and (indent_pt < 8.0 or 20.0 < indent_pt < 50.0)
             )
             if _is_red_line:
                 para.paragraph_format.first_line_indent = Pt(35.4)
