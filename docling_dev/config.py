@@ -12,6 +12,9 @@ EMU_PER_INCH = 914400
 FONT_NAME = "Times New Roman"
 BODY_PT   = 11.0
 
+# Межстрочный интервал абзацев ТЕЛА (заполняет страницу, как в юр-документах).
+LINE_SPACING = 1.5
+
 # Размер шрифта по семантической метке Docling
 LABEL_PT: dict[str, float] = {
     "title":          18.0,

@@ -21,7 +21,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 from .config import (
     BODY_PT, FONT_NAME, LABEL_HEADING, LABEL_MARGIN_THRESHOLD, LABEL_PT,
-    MARGIN_INCH, SKIP_LABELS,
+    LINE_SPACING, MARGIN_INCH, SKIP_LABELS,
 )
 from .docx_builder import (
     add_label_content_table, add_sidebyside, add_es_stamp,
@@ -1568,6 +1568,39 @@ def build_docx(
 
     _es_stamp_rendered = False
 
+    # ── Адаптивный межстрочный интервал ──────────────────────────────────────
+    # Базовый интервал тела LINE_SPACING (1.5) заполняет страницу, но на ПЛОТНЫХ
+    # страницах выталкивает текст дальше. Оцениваем объём текста каждой исходной
+    # страницы и подбираем интервал: малозаполненные → 1.5, плотные → меньше
+    # (до 1.0), чтобы контент не вылезал на следующую страницу.
+    def _estimate_page_spacing() -> dict[int, float]:
+        single_lh = BODY_PT * 1.15              # высота одинарной строки, pt
+        margin_pt = MARGIN_INCH * 72
+        lines: dict[int, float] = {}
+        _cur = 1
+        for _it, _ in all_items:
+            if _label_str(_it) not in ("text", "paragraph", "list_item"):
+                continue
+            _, _pg = _item_bbox_page(_it, _cur); _cur = _pg
+            _t = postprocess((getattr(_it, "text", None) or "").strip())
+            if not _t:
+                continue
+            _pw, _ph = page_sizes.get(_pg, (595.0, 842.0))
+            _cpl = max(40, int((_pw - 2 * margin_pt) / (BODY_PT * 0.50)))
+            lines[_pg] = lines.get(_pg, 0) + max(1, -(-len(_t) // _cpl))  # ceil
+        spacing: dict[int, float] = {}
+        for _pg, _ln in lines.items():
+            _pw, _ph = page_sizes.get(_pg, (595.0, 842.0))
+            avail = (_ph - 2 * margin_pt) * 0.85    # запас на интервалы/красную строку/шапку
+            base  = _ln * single_lh
+            spacing[_pg] = (max(1.0, min(LINE_SPACING, avail / base))
+                            if base > 0 else LINE_SPACING)
+        return spacing
+
+    page_line_spacing = _estimate_page_spacing()
+    log.info("Адаптивный интервал по страницам: %s",
+             {p: round(s, 2) for p, s in sorted(page_line_spacing.items())})
+
     for idx, (item, _level) in enumerate(all_items):
         if idx in skip_indices:
             raw = (getattr(item, "text", None) or "").strip()[:50]
@@ -2211,6 +2244,8 @@ def build_docx(
                 log.info("[стр%d] list_item → красная строка font=%.1fpt align=%-8s %r",
                          page_no, font_pt,
                          _align_names.get(alignment, str(alignment)), text[:60])
+            para.paragraph_format.line_spacing = page_line_spacing.get(
+                page_no, LINE_SPACING)                          # адаптивный интервал тела
             # Обновляем трекинг для последующей проверки continuation
             _last_body_para = para
             _last_body_text = text
@@ -2332,6 +2367,11 @@ def build_docx(
             para.paragraph_format.space_before  = Pt(space_before)
             para.paragraph_format.space_after   = Pt(0)
             para.paragraph_format.widow_control = False
+            # Межстрочный интервал тела (адаптивный по странице: плотные — меньше,
+            # чтобы текст не вылезал). Шапку (LEFT-колонка) оставляем плотной.
+            if alignment == WD_ALIGN_PARAGRAPH.JUSTIFY:
+                para.paragraph_format.line_spacing = page_line_spacing.get(
+                    page_no, LINE_SPACING)
 
             # Красная строка: ВСЕ полноширинные (JUSTIFY) абзацы тела получают
             # first-line indent — как в исходном юр-документе (у каждого абзаца
