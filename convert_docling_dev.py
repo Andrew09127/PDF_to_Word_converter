@@ -63,7 +63,7 @@ def _init_ocr_reader(langs: list[str]) -> object | None:
 
 def _convert_single(pdf_path: Path, out_dir: Path, use_word_order: bool,
                     highlight: bool = True, llm: bool = False,
-                    llm_model: str = "") -> None:
+                    llm_model: str = "", ink_bold: bool = False) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     docx_path = out_dir / f"{pdf_path.stem}.docx"
     logging.info("Один файл: %s", pdf_path.name)
@@ -73,7 +73,8 @@ def _convert_single(pdf_path: Path, out_dir: Path, use_word_order: bool,
 
     ok = convert_pdf(pdf_path, docx_path, converter,
                      ocr_reader=ocr_reader, use_word_order=use_word_order,
-                     highlight=highlight, llm=llm, llm_model=llm_model)
+                     highlight=highlight, llm=llm, llm_model=llm_model,
+                     ink_bold=ink_bold)
     if ok:
         logging.info("Готово: %s", docx_path)
     else:
@@ -83,7 +84,8 @@ def _convert_single(pdf_path: Path, out_dir: Path, use_word_order: bool,
 
 def _convert_batch(input_dir: Path, output_dir: Path, backup_dir: Path,
                    use_word_order: bool, highlight: bool = True,
-                   llm: bool = False, llm_model: str = "") -> None:
+                   llm: bool = False, llm_model: str = "",
+                   ink_bold: bool = False) -> None:
     DoclingBatchConverter(
         input_folder=str(input_dir),
         output_folder=str(output_dir),
@@ -92,6 +94,7 @@ def _convert_batch(input_dir: Path, output_dir: Path, backup_dir: Path,
         highlight=highlight,
         llm=llm,
         llm_model=llm_model,
+        ink_bold=ink_bold,
     ).process()
 
 
@@ -135,6 +138,13 @@ def main() -> None:
         "--llm-model", default="",
         help="Путь к .gguf-модели для доочистки (по умолч. вендоренная в models/)"
     )
+    parser.add_argument(
+        "--ink-bold", action="store_true",
+        help="ЭКСПЕРИМЕНТАЛЬНО: определять жирность по насыщенности штриха на "
+             "сканах. По умолчанию ВЫКЛ — на сканах толщину штриха задаёт состав "
+             "символов (заглавные имена толще), а не жирность, что даёт ложные "
+             "срабатывания. Имеет смысл для сканов высокого DPI (≥300)."
+    )
     args = parser.parse_args()
 
     use_word_order = args.word_order
@@ -145,7 +155,7 @@ def main() -> None:
             logging.error("Файл не найден: %s", args.pdf)
             sys.exit(1)
         _convert_single(args.pdf, args.output, use_word_order, highlight,
-                        args.llm, args.llm_model)
+                        args.llm, args.llm_model, args.ink_bold)
     else:
         if not args.input.is_dir():
             logging.error(
@@ -154,7 +164,7 @@ def main() -> None:
             )
             sys.exit(1)
         _convert_batch(args.input, args.output, args.backup, use_word_order,
-                       highlight, args.llm, args.llm_model)
+                       highlight, args.llm, args.llm_model, args.ink_bold)
 
 
 if __name__ == "__main__":

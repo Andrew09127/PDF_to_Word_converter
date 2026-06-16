@@ -54,7 +54,11 @@ def main() -> int:
     if not os.path.isabs(src_dir):
         src_dir = os.path.join(ROOT, src_dir)
     os.makedirs(GOLDEN_DIR, exist_ok=True)
-    docx_files = sorted(glob.glob(os.path.join(src_dir, "*.docx")))
+    # Исключаем временные lock-файлы Word (~$имя.docx), создаются при открытии в Word.
+    docx_files = sorted(
+        f for f in glob.glob(os.path.join(src_dir, "*.docx"))
+        if not os.path.basename(f).startswith("~$")
+    )
     if not docx_files:
         print("Нет DOCX в", OUT_DIR)
         return 1

@@ -59,8 +59,9 @@ from docling_dev.ocr_fixes import postprocess, fix_quotes
     # ── г. / пр. ─────────────────────────────────────────────────────────────
     ("&. Ростов",               "г. Ростов"),
     ("; &. Ростов",             "; г. Ростов"),
-    # Latin P вместо Cyrillic Р — OCR путает («Pocmов» вместо «Ростов»)
-    ("&. Pocmов-на-Дону",       "г. Pocmов-на-Дону"),
+    # Latin P вместо Cyrillic Р — OCR путает («Pocmов» вместо «Ростов»);
+    # правило нормализует латиницу обратно в «Ростов».
+    ("&. Pocmов-на-Дону",       "г. Ростов-на-Дону"),
     ("ир; Соколова",            "пр. Соколова"),
     ("ир: Соколова",            "пр. Соколова"),
     # Latin p вместо Cyrillic р — «иp:» вместо «ир:»
@@ -75,7 +76,8 @@ from docling_dev.ocr_fixes import postprocess, fix_quotes
     ("3+44000",                 "344000"),
 
     # ── Латинская B ──────────────────────────────────────────────────────────
-    ("ВКЛЮЧИТЬ B реестр",       "ВКЛЮЧИТЬ В реестр"),
+    # B→В, затем капслок-правило «ВКЛЮЧИТЬ»→«включить» (OCR-капс в середине)
+    ("ВКЛЮЧИТЬ B реестр",       "включить в реестр"),
     ("лимитом B размере",       "лимитом в размере"),
     # B в начале строки без предшествующей кириллицы → строчная в (контекст неизвестен)
     ("B реестр требований",     "в реестр требований"),
@@ -90,6 +92,9 @@ from docling_dev.ocr_fixes import postprocess, fix_quotes
     ("No 123",                  "№ 123"),
     ("Ng 123",                  "№ 123"),
     ("No. 123",                 "№ 123"),
+    # Слитный Ne после кириллицы (OCR потерял пробел и №)
+    ("требованияNе 14-02-25",   "требования № 14-02-25"),
+    ("договораNe 60190309",     "договора № 60190309"),
 
     # ── К/с ──────────────────────────────────────────────────────────────────
     ("Klс",                     "К/с"),   # OCR: К/с → Klс (l заменяет /)
@@ -113,6 +118,12 @@ from docling_dev.ocr_fixes import postprocess, fix_quotes
     # Уже есть — не дублировать
     ("344000, тел./факс: (863) 2-000-000, www.centrinvest.ru, welcome@centrinvest.ru",
      "344000, тел./факс: (863) 2-000-000, www.centrinvest.ru, welcome@centrinvest.ru"),
+
+    # ── Доменные OCR-слова (раунд spell) ─────────────────────────────────────
+    ("действует в соответствин с", "действует в соответствии с"),
+    ("на основании выеизложенного", "на основании вышеизложенного"),
+    ("договор с Заемшиком",        "договор с Заёмщиком"),
+    ("права заемщика защищены",    "права заёмщика защищены"),
 
     # ── Идентичность (не ломать то что уже правильно) ────────────────────────
     ("по делу № А53-3675/2025", "по делу № А53-3675/2025"),
@@ -553,7 +564,7 @@ def test_fix_order_caps_before_subtitle():
         _sec_header("ЗАЯВЛЕНИЕ"),                  # ALL-CAPS — должен стать первым
         _sec_header("требований кредиторов"),      # строчный — остаётся третьим
     ]
-    result = _fix_reading_order(items)
+    result, _ = _fix_reading_order(items)
     assert result[0][0].text == "ЗАЯВЛЕНИЕ", f"Got: {[r[0].text for r in result]}"
     assert result[1][0].text == "о включении в реестр"
 
@@ -564,7 +575,7 @@ def test_fix_order_caps_no_change_when_correct():
         _sec_header("ЗАЯВЛЕНИЕ"),
         _sec_header("о включении в реестр"),
     ]
-    result = _fix_reading_order(items)
+    result, _ = _fix_reading_order(items)
     assert result[0][0].text == "ЗАЯВЛЕНИЕ"
 
 
@@ -577,7 +588,7 @@ def test_fix_order_numbered_list_sorted():
         _list_item("5 Копия доп. соглашения"),
         _list_item("4 Копия кредитного договора"),
     ]
-    result = _fix_reading_order(items)
+    result, _ = _fix_reading_order(items)
     texts = [r[0].text for r in result]
     assert texts[0].startswith("1 "), f"Got: {texts}"
     assert texts[1].startswith("2 ")
@@ -593,19 +604,180 @@ def test_fix_order_numbered_already_sorted():
         _list_item("2 Копия"),
         _list_item("3 Расчет"),
     ]
-    result = _fix_reading_order(items)
+    result, _ = _fix_reading_order(items)
     assert result[0][0].text == "1 Документы"
 
 
 def test_fix_order_unnumbered_at_end():
-    """Ненумерованные list_items остаются в конце после сортировки."""
+    """Ненумерованный пункт в конце получает автонумерацию-продолжение:
+    OCR часто теряет номер, поэтому к 1–3 добавляется «4 …»."""
     items = [
         _list_item("2 Копия поручения"),
         _list_item("1 Документы"),
         _list_item("3 Расчет"),
-        _list_item("Копия доверенности"),   # без номера
+        _list_item("Копия доверенности"),   # без номера → станет «4 …»
     ]
-    result = _fix_reading_order(items)
+    result, _ = _fix_reading_order(items)
     texts = [r[0].text for r in result]
     assert texts[0].startswith("1 ")
-    assert texts[-1] == "Копия доверенности", f"Got: {texts}"
+    assert texts[1].startswith("2 ")
+    assert texts[2].startswith("3 ")
+    assert texts[-1] == "4 Копия доверенности", f"Got: {texts}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  HIGHLIGHT — кириллический спелл-фиксер (_autofix_word)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from docling_dev.highlight import _autofix_word, _morph
+
+# Спелл-фиксер требует словаря pymorphy; без него тесты пропускаем.
+_need_morph = pytest.mark.skipif(_morph is None, reason="pymorphy не установлен")
+
+
+@_need_morph
+@pytest.mark.parametrize("garbled,fixed", [
+    ("нмущества",       "имущества"),
+    ("абластн",         "области"),
+    ("падтверждено",    "подтверждено"),
+    ("васстановлен",    "восстановлен"),
+    ("частнасти",       "частности"),
+    ("атсутстние",      "отсутствие"),
+    ("прнменяеная",     "применяемая"),
+    ("данньми",         "данными"),         # пара ь↔ы
+    ("несостоятельньм", "несостоятельным"), # пара ь↔ы
+    ("деятсльности",    "деятельности"),
+])
+def test_spell_fix_lower(garbled, fixed):
+    """Строчные чисто-кириллические OCR-опечатки с ЕДИНСТВЕННЫМ кандидатом."""
+    assert _autofix_word(garbled) == fixed
+
+
+@_need_morph
+def test_spell_fix_allcaps_preserves_case():
+    """ALL-CAPS заголовок чинится с сохранением регистра."""
+    assert _autofix_word("МЕЖРАПОННАЯ") == "МЕЖРАЙОННАЯ"
+
+
+@_need_morph
+@pytest.mark.parametrize("proper", ["Заречнев", "Аракслян", "Краснянскову"])
+def test_spell_fix_skips_titlecase(proper):
+    """Имена/фамилии (Первая-Заглавная) не «чиним» — только подсветка."""
+    assert _autofix_word(proper) is None
+
+
+@_need_morph
+@pytest.mark.parametrize("domain", [
+    "взыскателя", "займодавцу", "микрофинансовой", "коллекторская",
+])
+def test_spell_fix_skips_domain(domain):
+    """Доменные юр./фин. термины (нет в pymorphy, но верные) не трогаем."""
+    assert _autofix_word(domain) is None
+
+
+@_need_morph
+@pytest.mark.parametrize("ambiguous", ["арганом", "налоговон"])
+def test_spell_fix_skips_ambiguous(ambiguous):
+    """Несколько словарных кандидатов → не угадываем (отдаём на подсветку/LLM)."""
+    assert _autofix_word(ambiguous) is None
+
+
+@_need_morph
+@pytest.mark.parametrize("valid", ["имущества", "области", "требований", "договоров"])
+def test_spell_fix_keeps_valid(valid):
+    """Уже корректные слова не меняем."""
+    assert _autofix_word(valid) is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  INK — насыщенность штриха (жирность по изображению на сканах)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from docling_dev.ink import block_ink_stats
+
+try:
+    import numpy as _np
+    from PIL import Image as _PILImage
+    _HAS_NP = True
+except Exception:
+    _HAS_NP = False
+
+_need_np = pytest.mark.skipif(not _HAS_NP, reason="numpy/PIL не установлены")
+
+
+def _synthetic_text(stroke_px: int):
+    """Белый холст с тремя «текстовыми» полосами из вертикальных штрихов
+    заданной толщины — имитация тонкого/жирного шрифта."""
+    arr = _np.full((50, 200), 255, dtype=_np.uint8)
+    for row0 in (10, 25, 40):
+        for col in range(5, 195, 8):
+            arr[row0:row0 + 6, col:col + stroke_px] = 0
+    return _PILImage.fromarray(arr)
+
+
+@_need_np
+def test_ink_none_for_empty():
+    assert block_ink_stats(None) is None
+
+
+@_need_np
+def test_ink_none_for_tiny():
+    assert block_ink_stats(_PILImage.fromarray(_np.zeros((2, 2), dtype=_np.uint8))) is None
+
+
+@_need_np
+def test_ink_stroke_w_grows_with_thickness():
+    """Главное свойство: чем толще штрих, тем выше stroke_w/mean_run (жирнее)."""
+    thin = block_ink_stats(_synthetic_text(1))
+    mid  = block_ink_stats(_synthetic_text(2))
+    bold = block_ink_stats(_synthetic_text(3))
+    assert thin["stroke_w"] < mid["stroke_w"] < bold["stroke_w"]
+    assert thin["mean_run"] < mid["mean_run"] < bold["mean_run"]
+
+
+@_need_np
+def test_ink_robust_to_underline():
+    """Подчёркивание (длинная линия) НЕ должно раздувать stroke_w/mean_run:
+    толщина штриха букв сохраняется (линии-выбросы отсекаются max_run_px)."""
+    plain = block_ink_stats(_synthetic_text(1))
+    arr = _np.full((50, 200), 255, dtype=_np.uint8)
+    for row0 in (10, 25, 40):
+        for col in range(5, 195, 8):
+            arr[row0:row0 + 6, col:col + 1] = 0
+    arr[46:48, 5:195] = 0                       # длинная линия-подчёркивание
+    underlined = block_ink_stats(_PILImage.fromarray(arr))
+    assert abs(underlined["stroke_w"] - plain["stroke_w"]) < 0.6
+    assert abs(underlined["mean_run"] - plain["mean_run"]) < 0.6
+
+
+@_need_np
+def test_ink_dense_thin_not_bold():
+    """«Плотный, но тонкий» (имитация цифр) НЕ должен выглядеть жирным:
+    stroke_w остаётся как у тонкого, хотя stroke_density высокая."""
+    thin   = block_ink_stats(_synthetic_text(1))   # редкие тонкие штрихи
+    arr = _np.full((50, 200), 255, dtype=_np.uint8)
+    for row0 in (10, 25, 40):
+        for col in range(5, 195, 3):               # плотно, но тонко
+            arr[row0:row0 + 6, col:col + 1] = 0
+    dense = block_ink_stats(_PILImage.fromarray(arr))
+    assert abs(dense["stroke_w"] - thin["stroke_w"]) < 0.6
+    assert dense["stroke_density"] > thin["stroke_density"]   # плотность выше…
+    # …но толщина штриха та же — ink отделяет жирность от плотности
+
+
+@_need_np
+def test_ink_values_in_range():
+    st = block_ink_stats(_synthetic_text(2))
+    assert 0.0 <= st["stroke_density"] <= 1.0
+    assert 0.0 <= st["ink_ratio"] <= 1.0
+    assert st["stroke_w"] >= 0.0
+    assert st["mean_run"] >= 0.0
+
+
+@_need_np
+def test_ink_blank_is_zero():
+    """Чистый белый холст — нулевая насыщенность."""
+    blank = _PILImage.fromarray(_np.full((40, 120), 255, dtype=_np.uint8))
+    st = block_ink_stats(blank)
+    assert st["ink_ratio"] == 0.0
+    assert st["stroke_density"] == 0.0

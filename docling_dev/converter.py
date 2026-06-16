@@ -11,6 +11,7 @@ import gc
 import logging
 import re
 import shutil
+import statistics
 import time
 from collections import defaultdict
 from io import BytesIO
@@ -177,9 +178,64 @@ def _item_bbox_page(item, current_page: int):
     return bbox, page_no
 
 
+def _get_item_image(item, dl_doc):
+    """Возвращает PIL Image для item.
+
+    Docling кэширует page images при scale=images_scale (например 2.0), но
+    page.image обращается к scale=1.0 (default). Если get_image() вернул None,
+    пробуем напрямую через кэш страницы — берём первый доступный scale.
+    """
+    try:
+        img = item.get_image(dl_doc)
+        if img is not None:
+            return img
+    except Exception:
+        pass
+
+    # Fallback: crop из кэша страницы (любой доступный scale)
+    try:
+        prov_list = getattr(item, "prov", None) or []
+        if not prov_list:
+            return None
+        prov = prov_list[0]
+        bbox    = getattr(prov, "bbox", None)
+        page_no = int(getattr(prov, "page_no", 0))
+        page_obj = dl_doc.pages.get(page_no)
+        if page_obj is None or bbox is None:
+            return None
+        cache = getattr(page_obj, "_image_cache", {})
+        if not cache:
+            return None
+        page_size = getattr(page_obj, "size", None)
+        if page_size is None:
+            return None
+        page_h = float(getattr(page_size, "height", 0) or 0)
+        if page_h <= 0:
+            return None
+        # Берём изображение с наибольшим scale (лучшее качество)
+        for _, img_ref in sorted(cache.items(), key=lambda kv: kv[0], reverse=True):
+            pil = getattr(img_ref, "pil_image", None)
+            if pil is None:
+                continue
+            img_size = getattr(img_ref, "size", None)
+            if img_size is None:
+                continue
+            crop_bb = (
+                bbox.to_top_left_origin(page_height=page_h)
+                .scale_to_size(old_size=page_size, new_size=img_size)
+            )
+            return pil.crop(crop_bb.as_tuple())
+    except Exception as exc:
+        log.debug("_get_item_image fallback failed: %s", exc)
+    return None
+
+
 # ── Исправление порядка чтения ───────────────────────────────────────────────
 
-_NUM_ITEM_RE  = re.compile(r'^(\d+)\s')
+# Номер пункта: «1 », «1. », «1) » (OCR часто теряет точку). 1–2 цифры —
+# списки не длиннее 99 пунктов; защищает от срабатывания на суммах («1 356 000»
+# в этом контексте не list_item, но ограничение цифр — доп. страховка).
+_NUM_ITEM_RE  = re.compile(r'^(\d{1,2})[.)]?\s+')
 _DATE_START_RE = re.compile(r'^\d{2}\.\d{2}\.\d{4}')  # DD.MM.YYYY в начале блока
 
 
@@ -692,6 +748,85 @@ def _fix_reading_order(all_items: list) -> tuple[list, set]:
     return result, continuation_ids
 
 
+def _join_fragments(all_items: list, continuation_ids: set) -> set:
+    """
+    Склейка фрагментированных текстовых блоков для любых документов.
+
+    Docling при плохом качестве скана или нестандартном layout (угловые штампы,
+    ФНС-формы, газетные колонки) разбивает один абзац на множество коротких блоков
+    (1-2 слова каждый). Эта функция детектирует такие страницы и добавляет блоки
+    в continuation_ids — рендер склеит их в один параграф.
+
+    Активируется только на страницах, где >50% text/paragraph блоков «короткие»
+    (≤ 4 слова). Реальное разделение на предложения контролируется _prev_unfinished
+    в рендере: блок после «.» / «!» / «?» всегда начинает новый параграф.
+    """
+    # Порог 2 слова (а не 4): реквизитные строки «ИНН: 7728168971» (2 токена)
+    # были бы склеены при пороге 4, хотя это структурные блоки. При пороге 2
+    # склеиваем только однословные / двусловные OCR-фрагменты (характерные для
+    # штампов и ФНС-форм), не трогая реквизиты и короткие, но осмысленные блоки.
+    MAX_FRAG_WORDS = 2      # блок «короткий» если ≤ 2 слов
+    FRAG_THRESHOLD = 0.50   # >50% коротких блоков на странице → «фрагментированная»
+    MIN_BLOCKS     = 5      # минимум блоков для принятия решения
+    SAFE_LABELS    = frozenset({"text", "paragraph"})
+
+    def _pg(i: int) -> int:
+        pv = (getattr(all_items[i][0], "prov", None) or [None])[0]
+        return int(getattr(pv, "page_no", -1)) if pv else -1
+
+    def _lbl(i: int) -> str:
+        return _label_str(all_items[i][0])
+
+    def _txt(i: int) -> str:
+        return (getattr(all_items[i][0], "text", None) or "").strip()
+
+    # Собираем статистику text/paragraph-блоков по страницам
+    from collections import defaultdict
+    page_idxs:  defaultdict[int, list[int]] = defaultdict(list)
+    page_short: defaultdict[int, int]       = defaultdict(int)
+
+    for i in range(len(all_items)):
+        if _lbl(i) not in SAFE_LABELS:
+            continue
+        pg = _pg(i)
+        if pg < 0:
+            continue
+        page_idxs[pg].append(i)
+        if len(_txt(i).split()) <= MAX_FRAG_WORDS:
+            page_short[pg] += 1
+
+    # Определяем страницы с экстремальной фрагментацией
+    fragmented: set[int] = set()
+    for pg, idxs in page_idxs.items():
+        if len(idxs) < MIN_BLOCKS:
+            continue
+        ratio = page_short[pg] / len(idxs)
+        if ratio > FRAG_THRESHOLD:
+            fragmented.add(pg)
+            log.info("fragment-join: стр.%d — %.0f%% коротких блоков (%d/%d) → склейка",
+                     pg, ratio * 100, page_short[pg], len(idxs))
+
+    if not fragmented:
+        return continuation_ids
+
+    # Маркируем блоки: КАЖДЫЙ кроме первого на странице → кандидат на склейку.
+    # Финальное решение принимает рендер через _prev_unfinished (не склеивает
+    # после «.», «!», «?» — так границы предложений сохраняются).
+    seen_page: set[int] = set()
+    for i in range(len(all_items)):
+        if _lbl(i) not in SAFE_LABELS:
+            continue
+        pg = _pg(i)
+        if pg not in fragmented:
+            continue
+        if pg in seen_page:
+            continuation_ids.add(id(all_items[i][0]))
+        else:
+            seen_page.add(pg)
+
+    return continuation_ids
+
+
 # ── Основная функция построения DOCX ─────────────────────────────────────────
 
 _LETTERHEAD_STOP_RE = re.compile(
@@ -831,9 +966,9 @@ def _render_native_two_column_header(
         if not text:
             return top, {}
         lbl = _label_str(item)
-        alpha = [c for c in text if c.isalpha()]
-        bold = (lbl in ("title", "section_header") or
-                (bool(alpha) and all(c.isupper() for c in alpha) and len(text) <= 60))
+        # Жирные только структурные заголовки. НЕ жирним ALL-CAPS аббревиатуры/
+        # реквизиты (ИНН/БИК/КПП) и имена — это давало ложную жирность в шапке.
+        bold = lbl in ("title", "section_header")
         return top, {"text": text, "font_pt": BODY_PT, "bold": bold, "italic": False}
 
     # Собираем блоки правой колонки по top (сверху вниз).
@@ -1040,6 +1175,12 @@ def _render_native_two_column_header(
         zayav_block = None
         below_blocks = []
 
+    # Канонический порядок реквизитов: Р/с → КПП → ИНН → Кор/сч → БИК.
+    # OCR/Y-сортировка иногда ставит КПП перед Р/с. Реордерим только СМЕЖНЫЙ прогон
+    # реквизитных блоков (не трогая юрлицо-ИНН/ОГРН, отделённые адресом/местом).
+    above_blocks = _reorder_requisite_blocks(above_blocks)
+    below_blocks = _reorder_requisite_blocks(below_blocks)
+
     # Геометрия колонок (лого-колонка = 7см на линейке Word)
     if logo_data is not None:
         pil_img, pic_w_pt, img_w_inch = logo_data
@@ -1110,13 +1251,57 @@ _REQ_LABEL_RE = re.compile(
     r'Получатель|Расч[её]тный\s+счет|Корреспондентский\s+счет)\b',
     re.IGNORECASE)
 
+# Канонический приоритет реквизитных строк: Р/с → КПП → ИНН → Кор/сч → БИК.
+# «Реквизиты для перечисления…»/«Plc:» — это строка Р/с (приоритет 0).
+_REQ_PRIO_RES = [
+    (re.compile(r'^\s*(?:Реквизиты\s+для\s+перечисл|Р\s*/\s*с|Plc|Расч[её]тный)', re.IGNORECASE), 0),
+    (re.compile(r'^\s*КПП', re.IGNORECASE), 1),
+    (re.compile(r'^\s*ИНН', re.IGNORECASE), 2),
+    (re.compile(r'^\s*(?:Кор|Корреспондентский)', re.IGNORECASE), 3),
+    (re.compile(r'^\s*БИК', re.IGNORECASE), 4),
+]
+
+
+def _req_prio(text: str):
+    for rx, p in _REQ_PRIO_RES:
+        if rx.match(text or ""):
+            return p
+    return None
+
+
+def _reorder_requisite_blocks(blocks: list[dict]) -> list[dict]:
+    """Реордерит СМЕЖНЫЕ прогоны реквизитных блоков в канонический порядок
+    (Р/с, КПП, ИНН, Кор/сч, БИК). Несмежные (юрлицо-ИНН, отделённый адресом) и
+    нереквизитные блоки не трогаем."""
+    out = list(blocks)
+    i = 0
+    n = len(out)
+    while i < n:
+        if _req_prio(out[i].get("text", "")) is None:
+            i += 1
+            continue
+        j = i
+        while j < n and _req_prio(out[j].get("text", "")) is not None:
+            j += 1
+        if j - i >= 2:
+            out[i:j] = sorted(out[i:j], key=lambda b: _req_prio(b.get("text", "")))
+        i = j
+    return out
+
+
 # Маркер начала штампа электронной подписи
 _ES_STAMP_MARKER_RE = re.compile(
     r'Электронн\w*\s+подпис\w*\s+действительн', re.IGNORECASE)
 
 # Детекторы строки подписи
-_REPR_RE     = re.compile(r'представитель\s+по\s+доверенности', re.IGNORECASE)
-_INITIALS_RE = re.compile(r'^[А-ЯЁA-Z]\.[А-ЯЁA-Z]\.\S+')
+# «Представитель по доверенности» / «Представитель КРЕДИТОРА по доверенности» /
+# «Представитель АО … по доверенности» — допускаем слова между.
+_REPR_RE     = re.compile(r'представитель\b.{0,40}?\bпо\s+доверенности', re.IGNORECASE)
+# Инициалы: «И.О.Фамилия» ИЛИ «Фамилия И.О.»/«Фамилия И О:» (напр. «Зайнуллина Д.Р.»,
+# «Зайнуллина Д Р:» — OCR теряет точки/ставит двоеточие).
+_INITIALS_RE = re.compile(
+    r'^(?:[А-ЯЁA-Z]\.\s*[А-ЯЁA-Z]\.\s*\S+'
+    r'|[А-ЯЁ][а-яё]+\s+[А-ЯЁ][.\s]\s*[А-ЯЁ][.:\s]?)')
 
 # Слова-стартеры новых абзацев — блокируют ложное _is_justify_cont слияние
 _PARA_STARTERS_RE = re.compile(
@@ -1235,10 +1420,7 @@ def _render_first_page_letterhead(
         text_indices.append(idx)
         text_blocks.append((idx, item, bbox, text))
 
-    try:
-        pil_img = pic_item.get_image(dl_doc)
-    except Exception:
-        pil_img = None
+    pil_img = _get_item_image(pic_item, dl_doc)
     if pil_img is None:
         return _empty
 
@@ -1364,6 +1546,7 @@ def build_docx(
     use_word_order: bool = True,
     doc_type: str | None = None,
     page_infos=None,
+    ink_bold: bool = False,
 ) -> object:
     """
     Конвертирует DoclingDocument в python-docx Document.
@@ -1426,6 +1609,22 @@ def build_docx(
         # Для других типов — базовые исправления из старого кода
         all_items, _continuation_ids = _fix_reading_order(all_items)
 
+    # Универсальная склейка фрагментов: для ЛЮБОГО типа документа.
+    # Детектирует страницы с экстремальной фрагментацией (>50% коротких блоков)
+    # и помечает их как continuation — рендер склеит соседние блоки в абзацы.
+    _continuation_ids = _join_fragments(all_items, _continuation_ids)
+
+    # iterate_items() ПРОПУСКАЕТ page_footer, но строку подписи OCR часто метит
+    # именно так («Представитель … по доверенности» + ФИО). Возвращаем эти блоки
+    # в обработку (рендерятся ниже как группа подписи).
+    for _ft in getattr(dl_doc, "texts", []):
+        if "page_footer" not in str(getattr(_ft, "label", "")).lower():
+            continue
+        _ftt = (getattr(_ft, "text", None) or "").strip()
+        if _REPR_RE.search(_ftt) or _INITIALS_RE.match(_ftt):
+            all_items.append((_ft, 0))
+            log.info("signature footer возвращён в обработку: %r", _ftt[:50])
+
     doc               = init_document()
     last_content_page = -1
     current_page      = -1
@@ -1455,11 +1654,15 @@ def build_docx(
     _image_pages_rendered: set[int] = set() # страницы уже вставленные как картинки
     skip_indices: set[int] = set()
 
-    def _page_break(target: int) -> None:
+    def _page_break(target: int, force: bool = False) -> None:
         nonlocal last_content_page
-        if last_content_page >= 0 and target > last_content_page:
-            # Добавляем разрыв страницы в ПОСЛЕДНИЙ параграф (не отдельным пустым),
-            # чтобы избежать «пустой страницы» между секциями документа.
+        # Для ТЕКСТА разрыв НЕ форсируем: текст юр-документа сплошной, Word сам
+        # переносит при заполнении. Принудительный разрыв на границе страницы скана
+        # оставлял ПУСТОТЫ внизу (плотная страница переливалась на 1.x) и раздувал
+        # документ. Но для ТАБЛИЦ/КАРТИНОК (force=True), которые в оригинале стоят
+        # на новой странице, разрыв сохраняем — иначе крупный блок «всплывает» вверх
+        # (таблица съезжает на предыдущий лист).
+        if force and last_content_page >= 0 and target > last_content_page:
             if _last_body_para is not None:
                 from docx.enum.text import WD_BREAK
                 _last_body_para.add_run().add_break(WD_BREAK.PAGE)
@@ -1468,6 +1671,7 @@ def build_docx(
                 pb.paragraph_format.space_before  = Pt(0)
                 pb.paragraph_format.space_after   = Pt(0)
                 pb.paragraph_format.widow_control = False
+        last_content_page = target
         last_content_page = target
 
     # Передаём OCR-блоки первой страницы для дополнения шапки
@@ -1573,21 +1777,26 @@ def build_docx(
     # страницах выталкивает текст дальше. Оцениваем объём текста каждой исходной
     # страницы и подбираем интервал: малозаполненные → 1.5, плотные → меньше
     # (до 1.0), чтобы контент не вылезал на следующую страницу.
-    def _estimate_page_spacing() -> dict[int, float]:
+    def _estimate_page_metrics():
         single_lh = BODY_PT * 1.15              # высота одинарной строки, pt
         margin_pt = MARGIN_INCH * 72
         lines: dict[int, float] = {}
+        line_hs: dict[int, list[float]] = {}    # высоты СТРОК по странице (для кегля)
         _cur = 1
         for _it, _ in all_items:
             if _label_str(_it) not in ("text", "paragraph", "list_item"):
                 continue
-            _, _pg = _item_bbox_page(_it, _cur); _cur = _pg
+            _bb, _pg = _item_bbox_page(_it, _cur); _cur = _pg
             _t = postprocess((getattr(_it, "text", None) or "").strip())
             if not _t:
                 continue
             _pw, _ph = page_sizes.get(_pg, (595.0, 842.0))
             _cpl = max(40, int((_pw - 2 * margin_pt) / (BODY_PT * 0.50)))
-            lines[_pg] = lines.get(_pg, 0) + max(1, -(-len(_t) // _cpl))  # ceil
+            _nl = max(1, -(-len(_t) // _cpl))   # оценка строк блока (ceil)
+            lines[_pg] = lines.get(_pg, 0) + _nl
+            _h = bbox_h(_bb) if _bb is not None else 0.0
+            if _h > 2:
+                line_hs.setdefault(_pg, []).append(_h / _nl)  # высота ОДНОЙ строки
         spacing: dict[int, float] = {}
         for _pg, _ln in lines.items():
             _pw, _ph = page_sizes.get(_pg, (595.0, 842.0))
@@ -1595,11 +1804,124 @@ def build_docx(
             base  = _ln * single_lh
             spacing[_pg] = (max(1.0, min(LINE_SPACING, avail / base))
                             if base > 0 else LINE_SPACING)
-        return spacing
+        line_median: dict[int, float] = {}
+        body_pt: dict[int, float] = {}
+        for _pg, _hs in line_hs.items():
+            _s = sorted(_hs); _med = _s[len(_s) // 2]
+            line_median[_pg] = _med
+            # АБСОЛЮТНЫЙ кегль тела по измеренному шагу строк оригинала: font ≈
+            # pitch/1.15 (одинарный интервал TNR). Чтобы результат занимал столько же
+            # страниц, сколько скан: мелкий шрифт (10pt) не раздувается до 11pt,
+            # а крупный — не жмётся. Калибровка: Doc1 pitch→11pt, ПСБ→10pt.
+            # Ограничиваем [9.5 .. 12].
+            body_pt[_pg] = max(9.5, min(12.0, round(_med / 1.15 * 2) / 2))
+        return spacing, line_median, body_pt
 
-    page_line_spacing = _estimate_page_spacing()
+    page_line_spacing, page_line_median, page_body_pt = _estimate_page_metrics()
     log.info("Адаптивный интервал по страницам: %s",
              {p: round(s, 2) for p, s in sorted(page_line_spacing.items())})
+    log.info("Адаптивный кегль тела по страницам: %s",
+             {p: v for p, v in sorted(page_body_pt.items())})
+
+    # ── Жирность по изображению (сканы) ───────────────────────────────────────
+    # На сканах Docling formatting.bold пуст → оцениваем жирность по насыщенности
+    # штриха. Для body-блоков считаем stroke_density (ink.py), берём МЕДИАНУ тела
+    # по странице; в основном цикле блок жирный, если заметно темнее медианы.
+    # Кэшируем по id(item), чтобы не пересчитывать кроп дважды.
+    _INK_BOLD_K  = 1.30   # порог: stroke_density > median * K → жирный
+    _INK_MIN_LEN = 15     # короткие блоки статистически шумны — пропускаем
+
+    # «Скан» определяем по ОТСУТСТВИЮ Docling formatting у всех элементов
+    # (OCR не даёт стиль). pdf_native — это лишь система координат (y снизу), а
+    # НЕ признак текстового слоя: сканы тоже бывают с native-координатами.
+    def _doc_has_formatting() -> bool:
+        for _it, _ in all_items:
+            _f = getattr(_it, "formatting", None)
+            if _f is not None and (getattr(_f, "bold", False)
+                                   or getattr(_f, "italic", False)):
+                return True
+        return False
+
+    # ink-жирность ОПЦИОНАЛЬНА (по умолчанию выкл). Эксперименты показали: толщина
+    # штриха на скане НЕ разделяет жирный/обычный даже при 300 DPI — её определяет
+    # состав символов (заглавные имена толще обычного текста), а не насыщенность
+    # шрифта. Включение даёт ложную жирность, поэтому по умолчанию полагаемся на
+    # структурную жирность (заголовки/метки). Флаг --ink-bold — для высокого DPI/опытов.
+    _use_ink = ink_bold and not _doc_has_formatting()
+    log.info("Жирность по изображению: %s",
+             "ВКЛ (опц.)" if _use_ink else
+             "выкл (структурная жирность по заголовкам/меткам)")
+
+    def _estimate_ink_medians():
+        if not _use_ink:
+            return {}, {}          # нативный PDF — доверяем Docling formatting
+        try:
+            from .ink import block_ink_stats
+        except Exception as _e:
+            log.debug("ink: модуль недоступен: %s", _e)
+            return {}, {}
+        ratios: dict[int, list[float]] = {}
+        cache: dict[int, float] = {}
+        _cur = 1
+        for _it, _ in all_items:
+            if _label_str(_it) not in ("text", "paragraph", "list_item"):
+                continue
+            _t = (getattr(_it, "text", None) or "").strip()
+            if len(_t) < _INK_MIN_LEN:
+                continue
+            _bb, _pg = _item_bbox_page(_it, _cur); _cur = _pg
+            try:
+                _img = _get_item_image(_it, dl_doc)
+            except Exception:
+                _img = None
+            _st = block_ink_stats(_img) if _img is not None else None
+            if _st is None:
+                continue
+            _run = _st["mean_run"]             # толщина штриха (среднее коротких пробегов)
+            cache[id(_it)] = _run
+            ratios.setdefault(_pg, []).append(_run)
+        medians = {p: statistics.median(rs) for p, rs in ratios.items() if rs}
+        if medians:
+            log.info("Жирность по изображению: медианы mean_run(px): %s",
+                     {p: round(m, 2) for p, m in sorted(medians.items())})
+        return medians, cache
+
+    page_ink_median, ink_cache = _estimate_ink_medians()
+
+    # ── Группы строки подписи ────────────────────────────────────────────────
+    # OCR метит подпись как page_footer + отдельная картинка, причём картинка в
+    # порядке чтения может идти РАНЬШЕ текста → собираем все компоненты подписи
+    # (должность «Представитель…по доверенности» + ФИО-инициалы + картинка) по
+    # странице ЗАРАНЕЕ и рендерим одной строкой при встрече первого компонента.
+    def _find_signature_groups() -> dict[int, dict]:
+        by_page: dict[int, list[int]] = {}
+        _cur = 1
+        for _i, (_it, _) in enumerate(all_items):
+            _, _pg = _item_bbox_page(_it, _cur); _cur = _pg
+            by_page.setdefault(_pg, []).append(_i)
+        groups: dict[int, dict] = {}
+        for _pg, idxs in by_page.items():
+            repr_i = init_i = pic_i = None
+            for _i in idxs:
+                _it = all_items[_i][0]
+                _lbl = _label_str(_it)
+                _t = postprocess((getattr(_it, "text", None) or "").strip())
+                if repr_i is None and _REPR_RE.search(_t):
+                    repr_i = _i
+                elif init_i is None and _INITIALS_RE.match(_t):
+                    init_i = _i
+                if pic_i is None and _lbl in ("picture", "figure", "image"):
+                    pic_i = _i
+            # Группа подписи только если есть «должность» И (инициалы ИЛИ картинка).
+            if repr_i is not None and (init_i is not None or pic_i is not None):
+                members = {x for x in (repr_i, init_i, pic_i) if x is not None}
+                groups[min(members)] = {"members": members, "repr": repr_i,
+                                        "init": init_i, "pic": pic_i, "page": _pg}
+        return groups
+
+    _sig_groups = _find_signature_groups()
+    if _sig_groups:
+        log.info("Группы подписи: %s", {a: g["members"] for a, g in _sig_groups.items()})
 
     for idx, (item, _level) in enumerate(all_items):
         if idx in skip_indices:
@@ -1609,7 +1931,12 @@ def build_docx(
             continue
 
         lbl = _label_str(item)
-        if not lbl or lbl in SKIP_LABELS:
+        # Исключение: строку подписи OCR часто метит как page_footer
+        # («Представитель … по доверенности» + ФИО). Её НЕ пропускаем — она
+        # обрабатывается ниже как строка подписи.
+        _is_sign_footer = (lbl == "page_footer"
+                           and _REPR_RE.search(getattr(item, "text", "") or ""))
+        if not lbl or (lbl in SKIP_LABELS and not _is_sign_footer):
             log.debug("[%d] пропуск (SKIP_LABELS): lbl=%r", idx, lbl)
             continue
 
@@ -1617,6 +1944,32 @@ def build_docx(
         current_page  = page_no
 
         pw, ph    = page_sizes.get(page_no, (595.0, 842.0))
+
+        # ── Строка подписи (группа: должность + ФИО + картинка) ───────────────
+        # Рендерим при встрече ПЕРВОГО компонента группы (порядок чтения может
+        # ставить картинку раньше текста), остальные компоненты пропускаем.
+        if idx in _sig_groups:
+            _g = _sig_groups[idx]
+            _repr_txt = postprocess(
+                (getattr(all_items[_g["repr"]][0], "text", None) or "").strip())
+            _r_txt = ""
+            if _g["init"] is not None:
+                _r_txt = postprocess(
+                    (getattr(all_items[_g["init"]][0], "text", None) or "").strip())
+            _s_img = None
+            if _g["pic"] is not None:
+                try:
+                    _s_img = _get_item_image(all_items[_g["pic"]][0], dl_doc)
+                except Exception:
+                    pass
+            _sig_tw = (pw - 2 * MARGIN_INCH * 72) / 72
+            add_signature_row(doc, _repr_txt, _r_txt, _sig_tw,
+                              space_before=8.0, sig_image=_s_img)
+            skip_indices.update(_g["members"])
+            _last_body_para = None
+            log.info("[стр%d] signature group: должность=%r инициалы=%r pic=%s",
+                     page_no, _repr_txt[:40], _r_txt, _s_img is not None)
+            continue
 
         # ── Штамп электронной подписи (ЭП) ───────────────────────────────────
         # Маркер «Электронная подпись действительна» открывает штамп ЭП. Собираем
@@ -1666,14 +2019,14 @@ def build_docx(
                 and lbl in ("picture", "figure", "image")):
             _image_pages_rendered.add(page_no)
             try:
-                pil_img = item.get_image(dl_doc)
+                pil_img = _get_item_image(item, dl_doc)
                 if pil_img is not None:
                     from io import BytesIO as _BytesIO
                     _buf = _BytesIO()
                     pil_img.save(_buf, format="PNG")
                     _buf.seek(0)
                     text_w_inch = (pw - 2 * MARGIN_INCH * 72) / 72
-                    _page_break(page_no)
+                    _page_break(page_no, force=True)   # страница-картинка — на свой лист
                     _para = doc.add_paragraph()
                     _para.alignment = WD_ALIGN_PARAGRAPH.CENTER
                     _para.paragraph_format.space_before = Pt(0)
@@ -1689,6 +2042,11 @@ def build_docx(
             continue
 
         font_pt = LABEL_PT.get(lbl, BODY_PT)
+        # Тело: АБСОЛЮТНЫЙ кегль по измеренному шагу строк оригинала (не фикс 11pt),
+        # чтобы число страниц совпадало со сканом (мелкий 10pt-скан не раздувается).
+        _base_pt = page_body_pt.get(page_no, BODY_PT)
+        if lbl in ("paragraph", "text", "list_item"):
+            font_pt = _base_pt
         # section_header в правой части первой страницы (блок сторон: «Арбитражный суд»,
         # «по делу №») — используем размер тела (11pt), не 13pt.
         # ЗАЯВЛЕНИЕ (x0=270.7 < pw*0.48=285.6) и подзаголовки остаются 13pt.
@@ -1697,25 +2055,34 @@ def build_docx(
             if _sh_x0 > pw * 0.48:
                 font_pt = BODY_PT
 
-        if lbl in ("paragraph", "text") and item_h > 2 and median_h > 0:
-            ratio = item_h / median_h
-            # Масштабируем только если явно меньше 0.55 медианы.
-            # НЕ масштабируем если это будет label:content — у них bbox часто мал
-            # из-за того что Docling даёт bbox только на метку, а не на всё содержимое.
+        if lbl in ("paragraph", "text") and item_h > 2:
+            # Кегль оцениваем по высоте ОДНОЙ СТРОКИ (item_h / число строк), а не
+            # по высоте блока: иначе однострочные нормальные блоки ошибочно
+            # сжимались (их высота < медианы многострочных) → «текст разного
+            # размера». Сравниваем с медианной высотой строки страницы.
             raw_x0 = float(getattr(bbox, "l", 0)) if bbox is not None else 0.0
             is_potential_label = raw_x0 <= pw * LABEL_MARGIN_THRESHOLD
-            # CENTER-блоки (Госпошлина, колонтитулы) — шрифт не уменьшаем:
-            # они либо намеренно мелкие (9pt), либо ложно сжаты по bbox.
-            # Примечание: alignment вычисляется позже — определяем здесь отдельно.
             _pre_align = (detect_alignment(bbox, pw)
                           if bbox is not None and pw > 0
                           else WD_ALIGN_PARAGRAPH.JUSTIFY)
-            if ratio < 0.55 and not is_potential_label \
+            _lm = page_line_median.get(page_no, 0.0)
+            if _lm > 0 and not is_potential_label \
                     and _pre_align != WD_ALIGN_PARAGRAPH.CENTER \
                     and _pre_align != WD_ALIGN_PARAGRAPH.RIGHT:
-                # RIGHT-выровненные блоки (суммы, госпошлина) — не уменьшаем:
-                # их bbox.h мал из-за однострочного содержимого.
-                font_pt = max(round(BODY_PT * ratio * 2) / 2, 9.0)
+                _txt_est = (getattr(item, "text", None) or "").strip()
+                _cpl_p = max(40, int((pw - 2 * MARGIN_INCH * 72) / (BODY_PT * 0.50)))
+                _nl    = max(1, -(-len(_txt_est) // _cpl_p))
+                _line_ratio = (item_h / _nl) / _lm
+                # масштабируем кегль по высоте строки относительно медианы тела:
+                # < 0.80 → уменьшаем (сноска/мелкий шрифт); > 1.30 → увеличиваем
+                # (подзаголовок/акцент в теле); около 1.0 — оставляем базовый кегль.
+                # Базой служит адаптивный _base_pt (кегль страницы), не фикс 11pt.
+                if _line_ratio < 0.80:
+                    font_pt = max(round(_base_pt * _line_ratio * 2) / 2, 8.0)
+                elif _line_ratio > 1.30:
+                    font_pt = min(round(_base_pt * _line_ratio * 2) / 2, 16.0)
+                    log.debug("[стр%d] крупная строка ratio=%.2f → font=%.1f %r",
+                              page_no, _line_ratio, font_pt, _txt_est[:40])
 
         # ── Таблицы ──────────────────────────────────────────────────────────
         if lbl == "table":
@@ -1728,7 +2095,7 @@ def build_docx(
                 nc = getattr(data, "num_cols",
                              max((len(r) for r in getattr(data, "grid", [[]])), default=0))
                 log.info("[стр%d] table: %d строк × %d столбцов", page_no, nr, nc)
-                _page_break(page_no)
+                _page_break(page_no, force=True)   # таблица на новой стр. скана — сохраняем разрыв
                 if hasattr(data, "grid") and data.grid:
                     add_table_from_grid(doc, data.grid)
                 elif getattr(data, "num_rows", 0) > 0:
@@ -1740,9 +2107,9 @@ def build_docx(
         # ── Картинки / логотипы ───────────────────────────────────────────────
         if lbl in ("picture", "figure", "image"):
             try:
-                pil_img = item.get_image(dl_doc)
+                pil_img = _get_item_image(item, dl_doc)
                 if pil_img is None:
-                    log.debug("[стр%d] %s: get_image вернул None — пропуск", page_no, lbl)
+                    log.debug("[стр%d] %s: изображение недоступно — пропуск", page_no, lbl)
                     continue
                 log.info("[стр%d] %s: %dx%d px", page_no, lbl, pil_img.width, pil_img.height)
                 text_w_inch = (pw - 2 * MARGIN_INCH * 72) / 72
@@ -1810,7 +2177,7 @@ def build_docx(
                         "alignment": WD_ALIGN_PARAGRAPH.LEFT,
                     })
 
-                _page_break(page_no)
+                _page_break(page_no, force=True)   # картинка/логотип на новой стр. — сохраняем разрыв
                 if right_blocks:
                     skip_indices.update(right_skip)
                     add_sidebyside(doc, pil_img, target_w_inch, right_blocks, text_w_inch)
@@ -1904,14 +2271,28 @@ def build_docx(
             if _REQ_LABEL_RE.match(text):
                 alignment = WD_ALIGN_PARAGRAPH.LEFT
 
-        # Жирный/курсив: берём из Docling formatting если есть (точно для PDF с
-        # текстовым слоем), иначе — эвристика. Для сканов formatting пуст → эвристика.
+        # Жирный/курсив (умная эвристика): Docling formatting (нативные PDF) →
+        # приоритет; для сканов — только СТРУКТУРНЫЕ заголовки (title/section_header)
+        # и Госпошлина-merge. НЕ жирним ALL-CAPS имена/реквизиты (давало ложную
+        # жирность). Метки полей (Должник:/Заявитель:) жирнятся в label:content-таблице.
         _fmt      = getattr(item, "formatting", None)
         _fmt_bold = bool(getattr(_fmt, "bold", False))   if _fmt is not None else False
         _fmt_ital = bool(getattr(_fmt, "italic", False)) if _fmt is not None else False
-        _alpha       = [c for c in text if c.isalpha()]
-        _is_all_caps = bool(_alpha) and all(c.isupper() for c in _alpha) and len(text.strip()) <= 60
-        bold   = _fmt_bold or lbl in ("title", "section_header") or _is_all_caps or _gosposhlina_bold
+        # Жирность по изображению (сканы): stroke_density блока заметно выше медианы
+        # тела страницы. Защиты: достаточная длина и НЕ полностью ALL-CAPS (caps
+        # искажает насыщенность → ложная жирность; такие строки жирнятся по метке).
+        _ink_bold = False
+        _ink_run  = None
+        if (_use_ink and lbl in ("text", "paragraph", "list_item")
+                and len(text) >= _INK_MIN_LEN):
+            _ink_run = ink_cache.get(id(item))
+            _ink_med = page_ink_median.get(page_no, 0.0)
+            _alpha = [c for c in text if c.isalpha()]
+            _all_caps = bool(_alpha) and all(c.isupper() for c in _alpha)
+            if (_ink_run is not None and _ink_med > 0 and not _all_caps
+                    and _ink_run > _ink_med * _INK_BOLD_K):
+                _ink_bold = True
+        bold   = _fmt_bold or lbl in ("title", "section_header") or _gosposhlina_bold or _ink_bold
         italic = _fmt_ital or lbl in ("caption", "footnote")
 
         # Предупреждение при нетипичном размере шрифта
@@ -1922,11 +2303,14 @@ def build_docx(
             log.warning("[стр%d] lbl=%s: font=%.1fpt СЛИШКОМ ВЕЛИК для тела — возможна ошибка",
                         page_no, lbl, font_pt)
 
-        log.info("[стр%d] lbl=%-16s align=%-8s bold=%s font=%.1f  %r",
+        _bold_src = ("fmt" if _fmt_bold else "ink" if _ink_bold
+                     else "lbl" if lbl in ("title", "section_header") else "-")
+        log.info("[стр%d] lbl=%-16s align=%-8s bold=%s(%s) font=%.1f run=%s  %r",
                  page_no, lbl,
                  _align_names.get(alignment, str(alignment)),
-                 "Y" if bold else "N",
+                 "Y" if bold else "N", _bold_src,
                  font_pt,
+                 ("%.2f" % _ink_run) if _ink_run is not None else "-",
                  text[:80])
 
         _page_break(page_no)
@@ -2148,7 +2532,10 @@ def build_docx(
             # Выравниваем ПО ЛЕВому краю колонки с тем же отступом, что и текстовые
             # соседи блока (иначе section_header центрируется/уезжает к левому полю).
             # Заголовки без «:» (ЗАЯВЛЕНИЕ, «Арбитражный суд…») сюда НЕ попадают.
-            if text.rstrip().endswith(":") and _h_x0 > pw * 0.42:
+            # alignment != CENTER: центрированные заголовки («ПРОШУ:») остаются по
+            # ЦЕНТРУ честно, а не через костыль left_indent (метки шапки не центрируются).
+            if (text.rstrip().endswith(":") and _h_x0 > pw * 0.42
+                    and alignment != WD_ALIGN_PARAGRAPH.CENTER):
                 alignment = WD_ALIGN_PARAGRAPH.LEFT
                 para.alignment = alignment
                 para.paragraph_format.left_indent = Pt(max(_h_x0 - _h_lm, 0.0))
@@ -2157,29 +2544,32 @@ def build_docx(
                 para.paragraph_format.left_indent = Pt(_h_indent_in * 72)
             else:
                 para.paragraph_format.left_indent = Pt(0)
-            # Заголовок «тип документа + подзаголовок» («ЗАЯВЛЕНИЕ о включении …»):
-            # Docling склеивает в один section_header, но в оригинале тип документа
-            # стоит ОТДЕЛЬНОЙ строкой. Выносим ЗАГЛАВНЫЙ тип на свою строку.
-            # Срабатывает только для центрированного section_header, где за ALL-CAPS
-            # словом(ами) следует строчное продолжение.
-            _title_m = (re.match(r'^([А-ЯЁ][А-ЯЁ]+(?:\s+[А-ЯЁ]+)*)\s+([а-яё].*)$',
+            # Заголовок «тип документа + подзаголовок/адрес» («ЗАЯВЛЕНИЕ о включении…»,
+            # «АРБИТРАЖНЫЙ СУД … ОБЛАСТИ 344002, г. Ростов…»): Docling склеивает в один
+            # section_header, но в оригинале ЗАГЛАВНЫЙ тип/название стоит ОТДЕЛЬНОЙ
+            # строкой, а подзаголовок/адрес — следующей, обычным шрифтом (не жирным,
+            # мельче). Выносим тип на свою строку; вторую часть — телесным стилем.
+            # За ALL-CAPS названием следует строчное слово (подзаголовок) ИЛИ цифра
+            # почтового индекса (адрес).
+            _title_m = (re.match(r'^([А-ЯЁ][А-ЯЁ]+(?:\s+[А-ЯЁ]+)*)\s+([а-яё\d].*)$',
                                  text, re.DOTALL)
                         if lbl == "section_header"
                            and alignment == WD_ALIGN_PARAGRAPH.CENTER
                         else None)
 
-            def _style_run(_r):
+            def _style_run(_r, bold=True, size=None):
                 _r.font.name      = FONT_NAME
-                _r.font.size      = Pt(font_pt)
-                _r.font.bold      = True
+                _r.font.size      = Pt(size if size is not None else font_pt)
+                _r.font.bold      = bold
                 _r.font.color.rgb = RGBColor(0, 0, 0)
 
             if _title_m:
                 run = para.add_run(_title_m.group(1))
                 _style_run(run)
                 run.add_break()
+                # Подзаголовок/адрес — обычным телесным шрифтом (как в оригинале).
                 run2 = para.add_run(_title_m.group(2))
-                _style_run(run2)
+                _style_run(run2, bold=False, size=BODY_PT)
             else:
                 run = para.add_run(text)
                 _style_run(run)
@@ -2194,7 +2584,11 @@ def build_docx(
                 alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             _li_alpha  = [c for c in text if c.isalpha()]
             num_match  = _NUM_ITEM_RE.match(text)
-            is_sub_item = bool(_li_alpha) and _li_alpha[0].islower() and not num_match
+            # Подпункт: явный дефис/буллет в начале (любой регистр далее) ИЛИ
+            # строчная первая буква (продолжение-перечисление).
+            _dash_sub  = bool(re.match(r'^\s*[-–—•·]\s+', text))
+            is_sub_item = (not num_match) and (
+                _dash_sub or (bool(_li_alpha) and _li_alpha[0].islower()))
 
             if num_match:
                 num_str   = num_match.group(1).strip() + "."
@@ -2224,7 +2618,9 @@ def build_docx(
                 para.paragraph_format.widow_control = False
                 para.paragraph_format.left_indent        = Pt(0)
                 para.paragraph_format.first_line_indent  = Pt(35.4)
-                run           = para.add_run("- " + text)
+                # Убираем уже имеющийся дефис/буллет, чтобы не задвоить «- - ».
+                _sub_body = re.sub(r'^\s*[-–—•·]\s+', '', text)
+                run           = para.add_run("- " + _sub_body)
                 run.font.name = FONT_NAME
                 run.font.size = Pt(font_pt)
                 log.info("[стр%d] list_item → dash   font=%.1fpt %r",
@@ -2253,7 +2649,8 @@ def build_docx(
             continue
 
         # ── Строка подписи: «Представитель по доверенности … / картинка / Инициалы» ──
-        if lbl in ("text", "paragraph") and _REPR_RE.search(text):
+        # page_footer — OCR часто метит строку подписи как колонтитул (см. carve-out выше).
+        if lbl in ("text", "paragraph", "page_footer") and _REPR_RE.search(text):
             _right_txt = ""
             _sig_pic   = None
             # Просматриваем ближайшие 10 элементов: ищем картинку подписи
@@ -2269,10 +2666,7 @@ def build_docx(
                     break
                 if _nj_lbl in ("picture", "figure", "image"):
                     if _sig_pic is None:
-                        try:
-                            _sig_pic = _nj_item.get_image(dl_doc)
-                        except Exception:
-                            pass
+                        _sig_pic = _get_item_image(_nj_item, dl_doc)
                     skip_indices.add(_j)
                     continue
                 _nj_text = postprocess(
@@ -2398,11 +2792,24 @@ def build_docx(
                 else:
                     para.paragraph_format.left_indent = Pt(0)
 
-            run           = para.add_run(text)
-            run.font.name = FONT_NAME
-            run.font.size = Pt(font_pt)
-            run.bold      = bold
-            run.italic    = italic
+            # Судебная шапка определения: блок, где Docling склеил «г. Город … Дело
+            # № … Судья …» в одну строку. Признак — наличие И «Дело №/N», И «Судья»
+            # (с заглавной: в теле «по делу»/«судья» строчные). Разбиваем на строки.
+            if (lbl in ("text", "paragraph")
+                    and re.search(r'Дело\s*[№N]', text)
+                    and re.search(r'\bСудья\b', text)):
+                text = re.sub(r'\s+(Дело\s*[№N])', r'\n\1', text)
+                text = re.sub(r'\s+(Судья\b)', r'\n\1', text)
+            # Поддержка переносов строк внутри блока (\n): Docling иногда склеивает
+            # визуальные строки шапки в один блок — разбиваем их обратно на строки.
+            for _k, _part in enumerate(text.split("\n")):
+                if _k > 0:
+                    para.add_run().add_break()
+                run           = para.add_run(_part)
+                run.font.name = FONT_NAME
+                run.font.size = Pt(font_pt)
+                run.bold      = bold
+                run.italic    = italic
 
             if lbl in ("text", "paragraph"):
                 _last_body_para  = para
@@ -2459,6 +2866,7 @@ def convert_pdf(
     highlight: bool = True,
     llm: bool = False,
     llm_model: str = "",
+    ink_bold: bool = False,
 ) -> bool:
     log.info("  Конвертация: %s", pdf_path.name)
     try:
@@ -2486,7 +2894,7 @@ def convert_pdf(
                 )
 
         doc = build_docx(dl_doc, page_sizes, ocr_reader=ocr_reader,
-                         use_word_order=effective_word_order)
+                         use_word_order=effective_word_order, ink_bold=ink_bold)
         if highlight:
             # Автоочистка детерминируемых OCR-ошибок в помеченных словах +
             # подсветка остатка жёлтым (для быстрой ручной вычитки).
@@ -2517,6 +2925,7 @@ class DoclingBatchConverter:
         highlight: bool = True,
         llm: bool = False,
         llm_model: str = "",
+        ink_bold: bool = False,
     ) -> None:
         self.input_folder   = Path(input_folder)
         self.output_folder  = Path(output_folder)
@@ -2526,6 +2935,7 @@ class DoclingBatchConverter:
         self.highlight      = highlight
         self.llm            = llm
         self.llm_model      = llm_model
+        self.ink_bold       = ink_bold
         self.output_folder.mkdir(parents=True, exist_ok=True)
         if self.backup_folder:
             self.backup_folder.mkdir(parents=True, exist_ok=True)
@@ -2571,7 +2981,8 @@ class DoclingBatchConverter:
                              ocr_reader=self.ocr_reader,
                              use_word_order=self.use_word_order,
                              highlight=self.highlight,
-                             llm=self.llm, llm_model=self.llm_model)
+                             llm=self.llm, llm_model=self.llm_model,
+                             ink_bold=self.ink_bold)
             if ok:
                 stats["ok"] += 1
                 if self.backup_folder and move_to_backup:
