@@ -1,0 +1,4 @@
+# Сюда класть .whl для офлайн-установки RapidOCR (rapidocr, onnxruntime + зависимости).
+# Скачать на машине с интернетом: pip download rapidocr onnxruntime -d vendor/wheels --only-binary :all:
+# Установить офлайн: pip install --no-index --find-links vendor/wheels rapidocr onnxruntime
+# См. INSTALL_RAPIDOCR.md

@@ -781,3 +781,65 @@ def test_ink_blank_is_zero():
     st = block_ink_stats(blank)
     assert st["ink_ratio"] == 0.0
     assert st["stroke_density"] == 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  OCR PREPROCESS — предобработка изображения перед EasyOCR
+# ─────────────────────────────────────────────────────────────────────────────
+
+from docling_dev.ocr_preprocess import preprocess_for_ocr
+
+try:
+    import cv2 as _cv2
+    _HAS_CV2 = True
+except Exception:
+    _HAS_CV2 = False
+
+_need_cv2 = pytest.mark.skipif(not (_HAS_NP and _HAS_CV2),
+                               reason="cv2/numpy не установлены")
+
+
+@_need_cv2
+def test_preprocess_returns_rgb_same_size():
+    """Возвращает 3-канальный RGB того же размера (EasyOCR ждёт RGB)."""
+    img = _np.full((120, 200, 3), 255, dtype=_np.uint8)
+    img[50:60, 20:180] = 30
+    out = preprocess_for_ocr(img)
+    assert out.shape == (120, 200, 3)
+
+
+@_need_cv2
+def test_preprocess_noop_on_non_array():
+    """Не-numpy вход (путь/None) возвращается как есть (no-op)."""
+    assert preprocess_for_ocr("page.png") == "page.png"
+    assert preprocess_for_ocr(None) is None
+
+
+@_need_cv2
+def test_preprocess_handles_grayscale():
+    """Серый вход (2D) не падает и даёт RGB."""
+    gray = _np.full((80, 120), 240, dtype=_np.uint8)
+    gray[30:36, 10:110] = 20
+    out = preprocess_for_ocr(gray)
+    assert out.ndim == 3 and out.shape[2] == 3
+
+
+@_need_cv2
+def test_preprocess_denoise_off_by_default():
+    """denoise по умолчанию выкл (он размывал текст и снижал confidence)."""
+    import inspect
+    sig = inspect.signature(preprocess_for_ocr)
+    assert sig.parameters["denoise"].default is False
+
+
+@_need_cv2
+def test_preprocess_no_crash_on_rotated():
+    """Повёрнутый текст (deskew) не вызывает падения."""
+    img = _np.full((150, 300, 3), 255, dtype=_np.uint8)
+    for r in range(40, 110, 20):
+        img[r:r + 4, 30:270] = 0
+    rot = _cv2.warpAffine(
+        img, _cv2.getRotationMatrix2D((150, 75), 3.0, 1.0), (300, 150),
+        borderValue=(255, 255, 255))
+    out = preprocess_for_ocr(rot)
+    assert out.shape == (150, 300, 3)

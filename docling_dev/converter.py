@@ -2926,6 +2926,8 @@ class DoclingBatchConverter:
         llm: bool = False,
         llm_model: str = "",
         ink_bold: bool = False,
+        ocr_preprocess: bool = True,
+        ocr_engine: str = "rapidocr",
     ) -> None:
         self.input_folder   = Path(input_folder)
         self.output_folder  = Path(output_folder)
@@ -2936,6 +2938,8 @@ class DoclingBatchConverter:
         self.llm            = llm
         self.llm_model      = llm_model
         self.ink_bold       = ink_bold
+        self.ocr_preprocess = ocr_preprocess
+        self.ocr_engine     = ocr_engine
         self.output_folder.mkdir(parents=True, exist_ok=True)
         if self.backup_folder:
             self.backup_folder.mkdir(parents=True, exist_ok=True)
@@ -2946,7 +2950,8 @@ class DoclingBatchConverter:
     def converter(self):
         if self._converter is None:
             log.info("Инициализация Docling pipeline (DocLayNet + TableFormer + EasyOCR)...")
-            self._converter = build_converter(self.langs)
+            self._converter = build_converter(self.langs, ocr_preprocess=self.ocr_preprocess,
+                                              ocr_engine=self.ocr_engine)
             log.info("Pipeline готов.")
         return self._converter
 

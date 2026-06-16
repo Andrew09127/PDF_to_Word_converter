@@ -63,12 +63,14 @@ def _init_ocr_reader(langs: list[str]) -> object | None:
 
 def _convert_single(pdf_path: Path, out_dir: Path, use_word_order: bool,
                     highlight: bool = True, llm: bool = False,
-                    llm_model: str = "", ink_bold: bool = False) -> None:
+                    llm_model: str = "", ink_bold: bool = False,
+                    ocr_preprocess: bool = True,
+                    ocr_engine: str = "rapidocr") -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     docx_path = out_dir / f"{pdf_path.stem}.docx"
     logging.info("Один файл: %s", pdf_path.name)
 
-    converter  = build_converter()
+    converter  = build_converter(ocr_preprocess=ocr_preprocess, ocr_engine=ocr_engine)
     ocr_reader = _init_ocr_reader(["ru", "en"]) if use_word_order else None
 
     ok = convert_pdf(pdf_path, docx_path, converter,
@@ -85,7 +87,8 @@ def _convert_single(pdf_path: Path, out_dir: Path, use_word_order: bool,
 def _convert_batch(input_dir: Path, output_dir: Path, backup_dir: Path,
                    use_word_order: bool, highlight: bool = True,
                    llm: bool = False, llm_model: str = "",
-                   ink_bold: bool = False) -> None:
+                   ink_bold: bool = False, ocr_preprocess: bool = True,
+                   ocr_engine: str = "easyocr") -> None:
     DoclingBatchConverter(
         input_folder=str(input_dir),
         output_folder=str(output_dir),
@@ -95,6 +98,8 @@ def _convert_batch(input_dir: Path, output_dir: Path, backup_dir: Path,
         llm=llm,
         llm_model=llm_model,
         ink_bold=ink_bold,
+        ocr_preprocess=ocr_preprocess,
+        ocr_engine=ocr_engine,
     ).process()
 
 
@@ -145,17 +150,31 @@ def main() -> None:
              "символов (заглавные имена толще), а не жирность, что даёт ложные "
              "срабатывания. Имеет смысл для сканов высокого DPI (≥300)."
     )
+    parser.add_argument(
+        "--ocr-preprocess", action="store_true",
+        help="Предобработка изображения перед EasyOCR (deskew + CLAHE-контраст) для "
+             "ПЛОХИХ сканов. По умолчанию ВЫКЛ: помогает шумным/наклонным сканам, но "
+             "может портить мелкий текст хороших (CLAHE-артефакты → кириллица как латиница)."
+    )
+    parser.add_argument(
+        "--ocr-engine", choices=["easyocr", "rapidocr"], default="rapidocr",
+        help="OCR-движок: rapidocr (по умолчанию, eslav PP-OCRv5 — намного точнее "
+             "на русских сканах) или easyocr. rapidocr требует вендоренные wheel + "
+             ".onnx модели (см. INSTALL_RAPIDOCR.md); если их нет — автооткат на easyocr."
+    )
     args = parser.parse_args()
 
     use_word_order = args.word_order
     highlight      = not args.no_highlight
+    ocr_preprocess = args.ocr_preprocess
 
     if args.pdf:
         if not args.pdf.is_file():
             logging.error("Файл не найден: %s", args.pdf)
             sys.exit(1)
         _convert_single(args.pdf, args.output, use_word_order, highlight,
-                        args.llm, args.llm_model, args.ink_bold)
+                        args.llm, args.llm_model, args.ink_bold, ocr_preprocess,
+                        args.ocr_engine)
     else:
         if not args.input.is_dir():
             logging.error(
@@ -164,7 +183,8 @@ def main() -> None:
             )
             sys.exit(1)
         _convert_batch(args.input, args.output, args.backup, use_word_order,
-                       highlight, args.llm, args.llm_model, args.ink_bold)
+                       highlight, args.llm, args.llm_model, args.ink_bold,
+                       ocr_preprocess, args.ocr_engine)
 
 
 if __name__ == "__main__":
