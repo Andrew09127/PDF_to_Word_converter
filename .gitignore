@@ -1,6 +1,10 @@
 __pycache__/
 *.py[cod]
 
+# Фронт (Vite/React): зависимости НЕ коммитим, но собранный dist/ — коммитим,
+# чтобы приложение запускалось офлайн без Node/npm (main.py раздаёт dist статикой).
+frontend/node_modules/
+
 pdf_conversion.log
 docling_conversion.log
 docling_convert.log
