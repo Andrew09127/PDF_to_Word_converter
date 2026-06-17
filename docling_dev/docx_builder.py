@@ -18,7 +18,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 from .config import (
     BODY_PT, EMU_PER_INCH, FONT_NAME,
-    LABEL_COL_RATIO, LABEL_LINE_RE,
+    LABEL_COL_RATIO, LABEL_LINE_RE, SIDE_LABEL_RE,
     MARGIN_INCH, PAGE_H_INCH, PAGE_W_INCH,
 )
 from .geometry import bbox_h, bbox_mid_y, bbox_x0, coplanar
@@ -525,16 +525,22 @@ def add_es_stamp(doc: Document, lines: list[str], width_inch: float) -> None:
 
 
 def split_label_content(text: str) -> tuple[str, str] | None:
-    """Возвращает (метка, содержимое) если текст начинается с ALL-CAPS метки."""
-    m = LABEL_LINE_RE.match(text.strip())
-    if not m:
-        return None
-    label = m.group(1).strip()
-    alpha = [c for c in label if c.isalpha()]
-    # Минимум 4 буквы: исключаем ИНН, БИК, КПП — они реквизиты, не метки блоков
-    if not alpha or not all(c.isupper() for c in alpha) or len(alpha) < 4:
-        return None
-    return label, m.group(2).strip()
+    """Возвращает (метка, содержимое), если текст начинается с метки блока:
+    ALL-CAPS метки (ДОЛЖНИК:/КРЕДИТОР:) ИЛИ якорной метки стороны в любом регистре
+    (Должник:/Кредитор:/Адрес:… — RapidOCR даёт их Titlecase, см. SIDE_LABEL_RE)."""
+    t = text.strip()
+    m = LABEL_LINE_RE.match(t)
+    if m:
+        label = m.group(1).strip()
+        alpha = [c for c in label if c.isalpha()]
+        # Минимум 4 буквы: исключаем ИНН, БИК, КПП — они реквизиты, не метки блоков
+        if alpha and all(c.isupper() for c in alpha) and len(alpha) >= 4:
+            return label, m.group(2).strip()
+    # Якорные Titlecase-метки сторон (Должник:/Кредитор:/Финансовый управляющий:…)
+    ms = SIDE_LABEL_RE.match(t)
+    if ms:
+        return ms.group(1).strip(), ms.group(2).strip()
+    return None
 
 
 def add_label_content_table(

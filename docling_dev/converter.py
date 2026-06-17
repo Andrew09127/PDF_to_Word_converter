@@ -22,7 +22,7 @@ from docx.shared import Inches, Pt, RGBColor
 
 from .config import (
     BODY_PT, FONT_NAME, LABEL_HEADING, LABEL_MARGIN_THRESHOLD, LABEL_PT,
-    LINE_SPACING, MARGIN_INCH, SKIP_LABELS,
+    LINE_SPACING, MARGIN_INCH, SIDE_LABEL_RE, SKIP_LABELS,
 )
 from .docx_builder import (
     add_label_content_table, add_sidebyside, add_es_stamp,
@@ -837,6 +837,14 @@ _LETTERHEAD_STOP_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Название юрлица (продолжение значения «Заявитель/Кредитор: …»). OCR нестабилен
+# и иногда метит такую строку как section_header — её НЕ нужно считать началом тела
+# (иначе хвост значения сыплется из шапки в тело). «ОПРЕДЕЛЕНИЕ»/«МИНФИН…» сюда не
+# попадают — они останутся стоп-маркерами тела. \w* ловит OCR-склейку «АКЦИОНЕРНОЕОБЩЕСТВО».
+_ENTITY_NAME_RE = re.compile(
+    r'^\s*(акционерн\w*|публичн\w*|обществ\w*|ооо|пао|оао|зао|ао|банк)\b',
+    re.IGNORECASE)
+
 # Стоп-паттерны шапки: блоки ниже этой точки — не шапка
 _HEADER_BODY_START_RE = re.compile(
     r"^\s*(заявлени[ея]|исковое\s+заявлени[ея]|требовани[ея]|"
@@ -889,8 +897,13 @@ def _render_native_two_column_header(
         text = postprocess((getattr(item, "text", None) or "").strip())
         if not text:
             continue
-        # Стоп: section_header / title = начало тела документа
-        if lbl in ("section_header", "title"):
+        # Стоп: section_header / title = начало тела документа. ИСКЛЮЧЕНИЕ — когда OCR
+        # ошибочно пометил как section_header название юрлица (продолжение значения
+        # «Заявитель/Кредитор: …»): такой блок НЕ начало тела, иначе хвост значения
+        # сыплется из шапки в тело слева. «ОПРЕДЕЛЕНИЕ»/«МИНФИН…» под исключение не
+        # подпадают и корректно ломают сбор шапки.
+        if (lbl in ("section_header", "title")
+                and not _ENTITY_NAME_RE.match(text)):
             break
         # Стоп: явный маркер начала тела
         if _HEADER_BODY_START_RE.match(text):
@@ -1215,25 +1228,52 @@ def _render_native_two_column_header(
     log.info("native_header: летерхед above=%d блоков, content=%.0fpt",
              len(above_blocks), content_col_pt)
 
-    # 2) «Заявитель (кредитор): | значение» — полноширинный label-content на своём месте
+    # 2) «Заявитель (кредитор):» — в оригинале это МЕТКА у левого края (под лого-
+    #    колонкой), а её ЗНАЧЕНИЕ (наименование юрлица, ИНН/ОГРН, дата, место
+    #    нахождения) — в ПРАВОЙ колонке, выровнено с «Арбитражный суд». Поэтому при
+    #    наличии логотипа рендерим строкой [метка в лого-колонке | значение справа];
+    #    без логотипа — обычным полноширинным label-content.
     if zayav_block is not None:
         txt = zayav_block.get("text", "")
         if "\t" in txt:
             lbl, val = txt.split("\t", 1)
         else:
-            lbl, val = txt, ""
+            # В реальном пайплайне блок приходит без \t: «Заявитель (кредитор):
+            # АКЦИОНЕРНОЕ ОБЩЕСТВО…». Отделяем метку по _ZAYAV_RE, иначе весь текст
+            # ушёл бы в lbl (левая лого-колонка, жирным) — что и ломало вёрстку.
+            m = _ZAYAV_RE.match(txt)
+            if m:
+                lbl, val = txt[:m.end()], txt[m.end():]
+            else:
+                lbl, val = txt, ""
         lbl = lbl.rstrip()
+        val = val.lstrip()
         if not lbl.endswith(":"):
             lbl += ":"
-        content_items = [{"text": val, "font_pt": BODY_PT, "bold": False, "italic": False}]
-        add_label_content_table(doc, lbl, content_items, text_w_inch, space_before=6.0)
+        if logo_data is not None:
+            add_header_row(doc, [
+                {"kind": "text",
+                 "blocks": [{"text": lbl, "font_pt": BODY_PT, "bold": True,
+                             "italic": False, "space_before": 6.0}],
+                 "width_pt": logo_col_pt,
+                 "alignment": WD_ALIGN_PARAGRAPH.LEFT},
+                {"kind": "text",
+                 "blocks": [{"text": val, "font_pt": BODY_PT, "bold": False,
+                             "italic": False, "space_before": 6.0}],
+                 "width_pt": content_col_pt,
+                 "alignment": WD_ALIGN_PARAGRAPH.LEFT},
+            ], text_w_inch)
+        else:
+            content_items = [{"text": val, "font_pt": BODY_PT, "bold": False, "italic": False}]
+            add_label_content_table(doc, lbl, content_items, text_w_inch, space_before=6.0)
         log.info("native_header: Заявитель в позиции %d: %r → %r", _zayav_idx, lbl, val[:50])
 
     # 3) below (Адрес для отправки, Реквизиты, «При перечислении…», Представитель) —
-    #    правым отступом: пустая лого-колонка слева, как продолжение правой колонки.
+    #    продолжение ЗНАЧЕНИЯ заявителя: в ПРАВОЙ колонке (пустая лого-колонка слева),
+    #    выровнено с наименованием юрлица. Под логотипом — пусто (так в оригинале).
     if below_blocks:
         add_header_row(doc, _right_col_cells(below_blocks, with_logo=False), text_w_inch)
-        log.info("native_header: below=%d блоков (правый отступ)", len(below_blocks))
+        log.info("native_header: below=%d блоков (правая колонка)", len(below_blocks))
 
     log.info("native_header: %d элементов в шапке", len(skip_set))
     return skip_set
@@ -1656,13 +1696,12 @@ def build_docx(
 
     def _page_break(target: int, force: bool = False) -> None:
         nonlocal last_content_page
-        # Для ТЕКСТА разрыв НЕ форсируем: текст юр-документа сплошной, Word сам
-        # переносит при заполнении. Принудительный разрыв на границе страницы скана
-        # оставлял ПУСТОТЫ внизу (плотная страница переливалась на 1.x) и раздувал
-        # документ. Но для ТАБЛИЦ/КАРТИНОК (force=True), которые в оригинале стоят
-        # на новой странице, разрыв сохраняем — иначе крупный блок «всплывает» вверх
-        # (таблица съезжает на предыдущий лист).
-        if force and last_content_page >= 0 and target > last_content_page:
+        # Разрыв страницы на КАЖДОЙ границе исходной страницы скана (target > текущей):
+        # число страниц и разбивка DOCX совпадают с оригиналом (выбор пользователя —
+        # «вёрстка строго под оригинал»). Да, если на странице скана мало текста, внизу
+        # останется пустое место — но это как в оригинале. (Параметр force больше не
+        # влияет на сам факт разрыва; оставлен для совместимости вызовов.)
+        if last_content_page >= 0 and target > last_content_page:
             if _last_body_para is not None:
                 from docx.enum.text import WD_BREAK
                 _last_body_para.add_run().add_break(WD_BREAK.PAGE)
@@ -1804,17 +1843,22 @@ def build_docx(
             base  = _ln * single_lh
             spacing[_pg] = (max(1.0, min(LINE_SPACING, avail / base))
                             if base > 0 else LINE_SPACING)
-        line_median: dict[int, float] = {}
-        body_pt: dict[int, float] = {}
+        line_median: dict[int, float] = {}      # ПОСТРАНИЧНО — для адаптивного интервала
         for _pg, _hs in line_hs.items():
-            _s = sorted(_hs); _med = _s[len(_s) // 2]
-            line_median[_pg] = _med
-            # АБСОЛЮТНЫЙ кегль тела по измеренному шагу строк оригинала: font ≈
-            # pitch/1.15 (одинарный интервал TNR). Чтобы результат занимал столько же
-            # страниц, сколько скан: мелкий шрифт (10pt) не раздувается до 11pt,
-            # а крупный — не жмётся. Калибровка: Doc1 pitch→11pt, ПСБ→10pt.
-            # Ограничиваем [9.5 .. 12].
-            body_pt[_pg] = max(9.5, min(12.0, round(_med / 1.15 * 2) / 2))
+            _s = sorted(_hs); line_median[_pg] = _s[len(_s) // 2]
+        # КЕГЛЬ — ОДИН на весь документ (медиана высот строк ВСЕХ страниц), а не по
+        # странице. Постраничный кегль прыгал между страницами при нестабильной
+        # сегментации OCR (RapidOCR: на стр.1 мелкая шапка тянет медиану вниз → 10pt,
+        # тело → 12pt — визуально «разный размер»). Документная медиана устойчива:
+        # тело доминирует по числу строк, мелкая шапка/выбросы не перевешивают.
+        # font ≈ pitch/1.15 (одинарный TNR), ограничение [9.5 .. 12].
+        _all_hs = sorted(_h for _hs in line_hs.values() for _h in _hs)
+        if _all_hs:
+            _doc_med = _all_hs[len(_all_hs) // 2]
+            _doc_pt  = max(9.5, min(12.0, round(_doc_med / 1.15 * 2) / 2))
+        else:
+            _doc_pt = BODY_PT
+        body_pt = {_pg: _doc_pt for _pg in page_sizes}
         return spacing, line_median, body_pt
 
     page_line_spacing, page_line_median, page_body_pt = _estimate_page_metrics()
@@ -1922,6 +1966,59 @@ def build_docx(
     _sig_groups = _find_signature_groups()
     if _sig_groups:
         log.info("Группы подписи: %s", {a: g["members"] for a, g in _sig_groups.items()})
+
+    # ── ПРЕД-ПРОХОД: координатное спаривание «значение РАНЬШЕ метки» ───────────
+    # OCR иногда инвертирует порядок чтения: значение (напр. «15.12.1969») идёт в
+    # списке РАНЬШЕ своей метки («Дата рождения:»). Тогда inline coplanar-поиск (он
+    # смотрит только ВПЕРЁД) оставляет метку пустой, а значение рендерится одиночным
+    # абзацем. Здесь находим такие пары координатно (значение правее метки, на той же
+    # строке ±8pt) и: метим значение в skip_indices (не рендерить отдельно) +
+    # запоминаем пару в _coplanar_back, чтобы метка взяла значение из карты.
+    _coplanar_back: dict[int, int] = {}
+    for _li, (_litem, _) in enumerate(all_items):
+        if _li in skip_indices:
+            continue
+        if _label_str(_litem) not in ("text", "paragraph"):
+            continue
+        _ltext = (getattr(_litem, "text", None) or "").rstrip()
+        if not _ltext.endswith(":"):
+            continue
+        _lprov = getattr(_litem, "prov", None) or []
+        if not _lprov:
+            continue
+        _lpg = int(getattr(_lprov[0], "page_no", -1))
+        _lbb = getattr(_lprov[0], "bbox", None)
+        if _lbb is None:
+            continue
+        _lpw, _lph = page_sizes.get(_lpg, (595.0, 842.0))
+        _ll = float(getattr(_lbb, "l", 0)); _lr = float(getattr(_lbb, "r", 0))
+        if not (_ll < _lpw * 0.50 and _lr < _lpw * 0.55):
+            continue
+        _ltop = max(float(getattr(_lbb, "t", 0)), float(getattr(_lbb, "b", 0)))
+        # значение ищем СРЕДИ ПРЕДШЕСТВУЮЩИХ блоков (тех, что inline-поиск не видит)
+        for _vi in range(max(0, _li - 12), _li):
+            if _vi in skip_indices or _vi in _coplanar_back.values():
+                continue
+            _vitem, _ = all_items[_vi]
+            if _label_str(_vitem) not in ("text", "paragraph"):
+                continue
+            _vtext = (getattr(_vitem, "text", None) or "").strip()
+            if not _vtext or _vtext.rstrip().endswith(":"):
+                continue
+            _vprov = getattr(_vitem, "prov", None) or []
+            if not _vprov or int(getattr(_vprov[0], "page_no", -1)) != _lpg:
+                continue
+            _vbb = getattr(_vprov[0], "bbox", None)
+            if _vbb is None:
+                continue
+            _vx0 = float(getattr(_vbb, "l", 0))
+            _vtop = max(float(getattr(_vbb, "t", 0)), float(getattr(_vbb, "b", 0)))
+            if _vx0 > _lr and abs(_vtop - _ltop) <= 8.0:
+                _coplanar_back[_li] = _vi
+                skip_indices.add(_vi)
+                log.info("coplanar-back: метка[%d] %r ← значение[%d] %r",
+                         _li, _ltext[:30], _vi, _vtext[:30])
+                break
 
     for idx, (item, _level) in enumerate(all_items):
         if idx in skip_indices:
@@ -2344,11 +2441,12 @@ def build_docx(
         # страницы, а следующий непропущенный блок — coplanar и правее.
         # Пример: «Место рождения:» (x0=172) + «ГОР. РОСТОВ-НА-ДОНУ» (x0=265)
         _coplanar_rendered = False
-        if (lbl in ("text", "paragraph") and bbox is not None
+        # Значение могло стоять РАНЬШЕ метки в порядке чтения — взято пред-проходом.
+        _cp_value_idx = _coplanar_back.get(idx)
+        if _cp_value_idx is None and (lbl in ("text", "paragraph") and bbox is not None
                 and text.rstrip().endswith(":")
                 and float(getattr(bbox, "l", 0)) < pw * 0.50
                 and float(getattr(bbox, "r", pw)) < pw * 0.55):
-            _cp_value_idx = None
             _label_right = float(getattr(bbox, "r", 0))
             # Верх метки: в pdf_native t>b, поэтому берём max(t,b)
             _label_top = max(float(getattr(bbox, "t", 0)), float(getattr(bbox, "b", 0)))
@@ -2381,7 +2479,7 @@ def build_docx(
                         and (getattr(_cj_item, "text", None) or "").rstrip().endswith(":")
                         and _cj_x0 >= _label_right):
                     break
-            if _cp_value_idx is not None:
+        if _cp_value_idx is not None:
                 _cj_item, _ = all_items[_cp_value_idx]
                 _cj_text = postprocess((getattr(_cj_item, "text", None) or "").strip())
                 if _cj_text:
@@ -2409,7 +2507,13 @@ def build_docx(
 
         # ── Блоки МЕТКА:содержимое ────────────────────────────────────────────
         _item_x0 = float(getattr(bbox, "l", 0)) if bbox is not None else 0.0
-        lc = split_label_content(text) if _item_x0 <= pw * LABEL_MARGIN_THRESHOLD else None
+        # Якорные метки сторон (Кредитор:/Должник:/Финансовый управляющий:…) собираем
+        # в ЛЮБОЙ части страницы: в ряде документов RapidOCR кладёт шапку сторон в
+        # правую колонку (x0 > порога), и обычное ограничение «левые 45%» их отсекало.
+        _is_side_label = SIDE_LABEL_RE.match(text) is not None
+        lc = (split_label_content(text)
+              if (_item_x0 <= pw * LABEL_MARGIN_THRESHOLD or _is_side_label)
+              else None)
         if lc is not None:
             _full_tw      = (pw - 2 * MARGIN_INCH * 72) / 72
             _lc_indent    = 0.0

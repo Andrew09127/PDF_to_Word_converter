@@ -41,3 +41,6 @@ tests/_*.py
 # в git лежат куски models/*.gguf.partNNN (<100 МБ), модель склеивается
 # из них автоматически при первом запуске (см. llm_correct._resolve_model).
 models/*.gguf
+
+# Инструкция по вендорингу моделей — локальный референс, на GitHub не нужна
+INSTALL_RAPIDOCR.md

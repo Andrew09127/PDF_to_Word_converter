@@ -15,9 +15,14 @@ from docling.document_converter import DocumentConverter, PdfFormatOption
 
 log = logging.getLogger(__name__)
 
-# Вендоренные кириллические модели RapidOCR (.onnx) — кладутся в models/rapidocr/.
-# det.onnx (детекция, языконезависима), cls.onnx (поворот, опц.),
-# rec.onnx (РАСПОЗНАВАНИЕ — обязательно КИРИЛЛИЧЕСКАЯ), keys.txt (словарь символов).
+# Вендоренные модели RapidOCR (.onnx) — кладутся в models/rapidocr/.
+# det.onnx (детекция, языконезависима) — ОБЯЗАТЕЛЬНО СЕРВЕРНАЯ ch_PP-OCRv5_det_server
+#   (~88МБ): mobile-детектор терял ~половину текста на части документов (низкий
+#   recall — не находил текстовые области), серверный находит почти всё. Mobile —
+#   дефолт пакета rapidocr (ch_PP-OCRv5_det_mobile), при нужде качается оттуда; в git
+#   НЕ держим (теряет текст). Recall дополнительно поднимает rapidocr_merge.py.
+# cls.onnx (поворот строки, опц.), rec.onnx (РАСПОЗНАВАНИЕ — eslav PP-OCRv5,
+#   КИРИЛЛИЦА), keys.txt (словарь символов; rec и keys — ПАРА).
 _RAPIDOCR_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", "rapidocr")
 
@@ -85,7 +90,9 @@ def build_converter(
     images_scale влияет на ВСЁ качество обработки:
       - При 72 DPI (scale=1.0) символы 1-2 пикселя → путаница I/l/1, U/0, Z/2
       - При 144 DPI (scale=2.0) символы 3-4 пикселя → значительно меньше ошибок
-      - При 216 DPI (scale=3.0) ещё лучше, но в 2× медленнее и требует RAM
+      - При 216 DPI (scale=3.0) выше распознавание, НО OCR дробит строки мельче →
+        конвертер оценивает более мелкий кегль → вёрстка пакуется плотнее и пагинация
+        расходится с оригиналом (Alfa 4→3 страницы). Поэтому по умолчанию 144.
     """
     if langs is None:
         langs = ["ru", "en"]
@@ -108,6 +115,16 @@ def build_converter(
     ocr_opts = _rapidocr_options(langs) if ocr_engine == "rapidocr" else None
     if ocr_opts is None:
         ocr_opts = _easyocr_options(langs)
+    else:
+        # Объединённая детекция на нескольких масштабах — повышает recall RapidOCR
+        # (часть строк находится только на одном из масштабов). Чистоту не теряем —
+        # распознаёт всё та же eslav rec-модель. Патч идемпотентен.
+        try:
+            from .rapidocr_merge import install_merged_detection
+            install_merged_detection()
+        except Exception as _exc:
+            import logging
+            logging.getLogger(__name__).debug("merged detection недоступен: %s", _exc)
 
     pipeline_opts = PdfPipelineOptions()
     pipeline_opts.do_ocr                                   = True

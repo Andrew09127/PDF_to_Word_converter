@@ -134,10 +134,11 @@ def main() -> None:
         help="Не подсвечивать жёлтым подозрительные (вероятно искажённые OCR) слова"
     )
     parser.add_argument(
-        "--llm", action="store_true",
-        help="Локальная LLM (llama-cpp-python + .gguf, в процессе) добивает "
-             "оставшиеся подсвеченные слова. Полностью локально, без отдельных "
-             "программ; если пакета/модели нет — шаг пропускается."
+        "--no-llm", action="store_true",
+        help="Отключить локальную LLM-доочистку. По умолчанию ВКЛ: llama-cpp-python "
+             "+ .gguf-модель добивает оставшиеся подсвеченные слова. Полностью "
+             "локально, без отдельных программ; если пакета/модели нет — шаг молча "
+             "пропускается (на остальную конвертацию не влияет)."
     )
     parser.add_argument(
         "--llm-model", default="",
@@ -166,6 +167,7 @@ def main() -> None:
 
     use_word_order = args.word_order
     highlight      = not args.no_highlight
+    llm            = not args.no_llm
     ocr_preprocess = args.ocr_preprocess
 
     if args.pdf:
@@ -173,7 +175,7 @@ def main() -> None:
             logging.error("Файл не найден: %s", args.pdf)
             sys.exit(1)
         _convert_single(args.pdf, args.output, use_word_order, highlight,
-                        args.llm, args.llm_model, args.ink_bold, ocr_preprocess,
+                        llm, args.llm_model, args.ink_bold, ocr_preprocess,
                         args.ocr_engine)
     else:
         if not args.input.is_dir():
@@ -183,7 +185,7 @@ def main() -> None:
             )
             sys.exit(1)
         _convert_batch(args.input, args.output, args.backup, use_word_order,
-                       highlight, args.llm, args.llm_model, args.ink_bold,
+                       highlight, llm, args.llm_model, args.ink_bold,
                        ocr_preprocess, args.ocr_engine)
 
 

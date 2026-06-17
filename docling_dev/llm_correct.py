@@ -90,6 +90,24 @@ _llm = None          # ленивый singleton модели (грузим од�
 _llm_failed = False
 
 
+def _cleanup_llm() -> None:
+    """Явно освобождает модель ПОКА интерпретатор жив. Без этого деструктор
+    llama_cpp.Llama.__del__ срабатывает уже на завершении интерпретатора, когда
+    ctypes-указатель free_model обнулён → «TypeError: 'NoneType' object is not
+    callable» (безвредный, но пугающий трейсбек после «Готово»)."""
+    global _llm
+    if _llm is not None:
+        try:
+            _llm.close()
+        except Exception:
+            pass
+        _llm = None
+
+
+import atexit as _atexit
+_atexit.register(_cleanup_llm)
+
+
 def _resolve_model(model_path: str | None) -> str | None:
     """Путь к .gguf. Если собранного файла нет, но рядом лежат куски
     `<имя>.gguf.partNNN` (модель режут на <100 МБ ради лимита GitHub) —
