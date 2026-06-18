@@ -5,6 +5,13 @@ __pycache__/
 # чтобы приложение запускалось офлайн без Node/npm (main.py раздаёт dist статикой).
 frontend/node_modules/
 
+# Офлайн-комплект Python-пакетов КОММИТИМ в git (для офлайн-установки после
+# git clone). Но крупные wheel (>95 МБ) лежат кусками .partNNN, а сам
+# реассемблированный .whl создаётся при установке (tools\reassemble_wheels.py)
+# и в git не нужен. См. README.md (раздел про офлайн-установку).
+offline_kit/wheels/torch-*.whl
+offline_kit/wheels/paddlepaddle-*.whl
+
 pdf_conversion.log
 docling_conversion.log
 docling_convert.log

@@ -14,9 +14,7 @@ ROOT = Path(__file__).parent.parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# ─────────────────────────────────────────────────────────────────────────────
 #  HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
 
 def make_bbox(t, b, l=0, r=100):
     return types.SimpleNamespace(t=t, b=b, l=l, r=r)
@@ -29,15 +27,12 @@ def make_pts(x0, y0, x1, y1):
 def make_ocr(x0, y0, x1, y1, text, conf=0.9):
     return (make_pts(x0, y0, x1, y1), text, conf)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 #  OCR FIXES
-# ─────────────────────────────────────────────────────────────────────────────
 
 from docling_dev.ocr_fixes import postprocess, fix_quotes
 
 @pytest.mark.parametrize("inp,expected", [
-    # ── Кавычки ──────────────────────────────────────────────────────────────
+    #Кавычки
     ("<Центр-инвест>",          "«Центр-инвест»"),
     ("<Центр-инвестэ текст",    "«Центр-инвест» текст"),
     ("<Авангардж текст",        "«Авангард» текст"),
@@ -48,8 +43,8 @@ from docling_dev.ocr_fixes import postprocess, fix_quotes
     ("@Центр-инвест> текст",    "«Центр-инвест» текст"),
     ("<<Центр-инвест>>",        "«Центр-инвест»"),
     ('"Центр-инвест"',          "«Центр-инвест»"),
-    ("«Центр-инвест»",          "«Центр-инвест»"),   # уже корректно
-    ("«ентр-инвест»",           "«Центр-инвест»"),   # OCR потерял Ц
+    ("«Центр-инвест»",          "«Центр-инвест»"),   
+    ("«ентр-инвест»",           "«Центр-инвест»"), 
 
     # ── Пунктуация ────────────────────────────────────────────────────────────
     ("ИНН 6163011391,; ОГРН",   "ИНН 6163011391, ОГРН"),
@@ -69,26 +64,26 @@ from docling_dev.ocr_fixes import postprocess, fix_quotes
     ("иp: Соколова",            "пр. Соколова"),
     ("mp. Соколова",            "пр. Соколова"),
 
-    # ── Цифры ────────────────────────────────────────────────────────────────
+    #Цифры
     ("]1234",                   "11234"),
     ("1234]",                   "12341"),
     ("1]23",                    "1123"),
     ("3+44000",                 "344000"),
 
-    # ── Латинская B ──────────────────────────────────────────────────────────
-    # B→В, затем капслок-правило «ВКЛЮЧИТЬ»→«включить» (OCR-капс в середине)
+    #Латинская B 
+    # B, затем капслок-правило «ВКЛЮЧИТЬ»→«включить» (OCR-капс в середине)
     ("ВКЛЮЧИТЬ B реестр",       "включить в реестр"),
     ("лимитом B размере",       "лимитом в размере"),
-    # B в начале строки без предшествующей кириллицы → строчная в (контекст неизвестен)
+    # B в начале строки без предшествующей кириллицы - строчная в (контекст неизвестен)
     ("B реестр требований",     "в реестр требований"),
     ("включить B реестр",       "включить в реестр"),
 
-    # ── Email ─────────────────────────────────────────────────────────────────
+    #Email 
     ("welcome@centrinvest пu n;", "welcome@centrinvest.ru"),
     ("welcome@centrinvest пи н;", "welcome@centrinvest.ru"),
     ("welcome@centrinvest ru",    "welcome@centrinvest.ru"),
 
-    # ── Знак № ───────────────────────────────────────────────────────────────
+    # ── Знак №
     ("No 123",                  "№ 123"),
     ("Ng 123",                  "№ 123"),
     ("No. 123",                 "№ 123"),
@@ -96,22 +91,22 @@ from docling_dev.ocr_fixes import postprocess, fix_quotes
     ("требованияNе 14-02-25",   "требования № 14-02-25"),
     ("договораNe 60190309",     "договора № 60190309"),
 
-    # ── К/с ──────────────────────────────────────────────────────────────────
-    ("Klс",                     "К/с"),   # OCR: К/с → Klс (l заменяет /)
-    ("K/с",                     "К/с"),   # OCR: К → K
-    ("Klc",                     "К/с"),   # OCR: с → c
+    #К/с 
+    ("Klс",                     "К/с"),   # OCR: К/с - Klс (l заменяет /)
+    ("K/с",                     "К/с"),   # OCR: К - K
+    ("Klc",                     "К/с"),   # OCR: с - c
 
-    # ── Двойной пробел ───────────────────────────────────────────────────────
+    #Двойной пробел
     ("слово  слово",            "слово слово"),
 
-    # ── Дефисный перенос ─────────────────────────────────────────────────────
+    #Дефисный перенос
     ("несосто- ятельным",       "несостоятельным"),
 
-    # ── Госпошлина ───────────────────────────────────────────────────────────
+    #Госпошлина
     ("Госпошлина : 100",        "Госпошлина: 100"),
     ("100 руб:",                "100 руб."),
 
-    # ── Восстановление тел./факс Центр-инвест ────────────────────────────────
+    #Восстановление тел./факс Центр-инвест 
     # EasyOCR стабильно пропускает эту строку; восстанавливаем по паттерну
     ("Россия, 344000, welcome@centrinvest.ru",
      "Россия, 344000, тел./факс: (863) 2-000-000, www.centrinvest.ru, welcome@centrinvest.ru"),
@@ -119,13 +114,13 @@ from docling_dev.ocr_fixes import postprocess, fix_quotes
     ("344000, тел./факс: (863) 2-000-000, www.centrinvest.ru, welcome@centrinvest.ru",
      "344000, тел./факс: (863) 2-000-000, www.centrinvest.ru, welcome@centrinvest.ru"),
 
-    # ── Доменные OCR-слова (раунд spell) ─────────────────────────────────────
+    #Доменные OCR-слова (раунд spell) 
     ("действует в соответствин с", "действует в соответствии с"),
     ("на основании выеизложенного", "на основании вышеизложенного"),
     ("договор с Заемшиком",        "договор с Заёмщиком"),
     ("права заемщика защищены",    "права заёмщика защищены"),
 
-    # ── Идентичность (не ломать то что уже правильно) ────────────────────────
+    #Идентичность
     ("по делу № А53-3675/2025", "по делу № А53-3675/2025"),
     ("г. Ростов-на-Дону",       "г. Ростов-на-Дону"),
     ("ИНН: 6163011391",         "ИНН: 6163011391"),
@@ -153,9 +148,7 @@ def test_postprocess_idempotent() -> None:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 #  GEOMETRY
-# ─────────────────────────────────────────────────────────────────────────────
 
 from docling_dev.geometry import (
     bbox_h, bbox_mid_y, bbox_x0, bbox_x1, coplanar,
@@ -211,10 +204,7 @@ def test_coplanar_none_args():
     assert coplanar(make_bbox(100, 80), None) is False
     assert coplanar(None, None) is False
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 #  WORD ORDER — структуры данных
-# ─────────────────────────────────────────────────────────────────────────────
 
 from docling_dev.word_order import (
     Word, VisualLine, TextBlock, reconstruct_blocks,
@@ -269,9 +259,7 @@ def test_text_block_with_lines():
     assert block.font_height > 0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 #  WORD ORDER — reconstruct_blocks
-# ─────────────────────────────────────────────────────────────────────────────
 
 def test_reconstruct_empty():
     assert reconstruct_blocks([]) == []
@@ -336,9 +324,7 @@ def test_reconstruct_all_words_zero_height_filtered():
     assert isinstance(blocks, list)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 #  CONVERTER — _reorder_by_word_order
-# ─────────────────────────────────────────────────────────────────────────────
 
 from docling_dev.converter import _reorder_by_word_order
 
@@ -376,7 +362,7 @@ def test_reorder_picture_untouched():
         (_fake_item("paragraph", 1, 0.50), 0),   # тело A
         (_fake_item("paragraph", 1, 0.70), 0),   # тело B
     ]
-    # word_order: B (70%) → block 0, A (50%) → block 1 (B выше чем A в px)
+    # word_order: B (70%) - block 0, A (50%) - block 1 (B выше чем A в px)
     blocks = [_word_block(0.30), _word_block(0.60)]
     word_blocks_map = {1: (blocks, 1000.0)}
     page_sizes = {1: (595.0, 842.0)}
@@ -390,8 +376,8 @@ def test_reorder_picture_untouched():
 def test_reorder_header_zone_excluded():
     """Элементы в топ 15% страницы не переставляются."""
     items = [
-        (_fake_item("paragraph", 1, 0.05), 0),   # < 15% → шапка, не трогать
-        (_fake_item("paragraph", 1, 0.10), 0),   # < 15% → шапка, не трогать
+        (_fake_item("paragraph", 1, 0.05), 0),   # < 15% - шапка, не трогать
+        (_fake_item("paragraph", 1, 0.10), 0),   # < 15% - шапка, не трогать
         (_fake_item("paragraph", 1, 0.50), 0),   # тело
         (_fake_item("paragraph", 1, 0.70), 0),   # тело
     ]
@@ -409,13 +395,6 @@ def test_reorder_header_zone_excluded():
 
 def test_reorder_body_corrected():
     """Body-параграфы переставляются по word_order-порядку."""
-    # 4 элемента: items близко друг к другу (y=0.20,0.22,0.24,0.80).
-    # Блоки в другом порядке: block0=0.23, block1=0.19, block2=0.21, block3=0.78.
-    # - item0(0.20) → block1(0.19) diff=0.01
-    # - item1(0.22) → block2(0.21) diff=0.01
-    # - item2(0.24) → block0(0.23) diff=0.01
-    # - item3(0.80) → block3(0.78) diff=0.02
-    # После сортировки по block_idx: item2, item0, item1, item3 — 3 перемещения.
     items = [
         (_fake_item("paragraph", 1, 0.20), 0),
         (_fake_item("paragraph", 1, 0.22), 0),
@@ -486,7 +465,7 @@ def test_reorder_min_move_threshold():
     original_texts = [x[0].text for x in items]
 
     # word_order меняет только первые два (один реально сдвигается)
-    # но оба получают одинаковый block_idx → нет реального смещения
+    # но оба получают одинаковый block_idx - нет реального смещения
     blocks = [_word_block(0.30), _word_block(0.50), _word_block(0.70)]
     word_blocks_map = {1: (blocks, 1000.0)}
     page_sizes = {1: (595.0, 842.0)}
@@ -494,10 +473,7 @@ def test_reorder_min_move_threshold():
     result = _reorder_by_word_order(items, word_blocks_map, page_sizes)
     assert [r[0].text for r in result] == original_texts
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 #  CONVERTER — _bbox_top_bottom / _is_letterhead_stop
-# ─────────────────────────────────────────────────────────────────────────────
 
 from docling_dev.converter import _bbox_top_bottom, _is_letterhead_stop
 
@@ -529,10 +505,7 @@ def test_is_letterhead_stop_no_match():
                  "www.centrinvest.ru", "344000, г. Ростов-на-Дону"]:
         assert not _is_letterhead_stop(text), f"Не должен быть стоп-маркером: {text!r}"
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 #  _fix_reading_order
-# ─────────────────────────────────────────────────────────────────────────────
 
 from docling_dev.converter import _fix_reading_order
 
@@ -624,10 +597,7 @@ def test_fix_order_unnumbered_at_end():
     assert texts[2].startswith("3 ")
     assert texts[-1] == "4 Копия доверенности", f"Got: {texts}"
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 #  HIGHLIGHT — кириллический спелл-фиксер (_autofix_word)
-# ─────────────────────────────────────────────────────────────────────────────
 
 from docling_dev.highlight import _autofix_word, _morph
 
@@ -688,10 +658,7 @@ def test_spell_fix_keeps_valid(valid):
     """Уже корректные слова не меняем."""
     assert _autofix_word(valid) is None
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 #  INK — насыщенность штриха (жирность по изображению на сканах)
-# ─────────────────────────────────────────────────────────────────────────────
 
 from docling_dev.ink import block_ink_stats
 
@@ -731,6 +698,7 @@ def test_ink_stroke_w_grows_with_thickness():
     thin = block_ink_stats(_synthetic_text(1))
     mid  = block_ink_stats(_synthetic_text(2))
     bold = block_ink_stats(_synthetic_text(3))
+    assert thin is not None and mid is not None and bold is not None
     assert thin["stroke_w"] < mid["stroke_w"] < bold["stroke_w"]
     assert thin["mean_run"] < mid["mean_run"] < bold["mean_run"]
 
@@ -746,6 +714,7 @@ def test_ink_robust_to_underline():
             arr[row0:row0 + 6, col:col + 1] = 0
     arr[46:48, 5:195] = 0                       # длинная линия-подчёркивание
     underlined = block_ink_stats(_PILImage.fromarray(arr))
+    assert plain is not None and underlined is not None
     assert abs(underlined["stroke_w"] - plain["stroke_w"]) < 0.6
     assert abs(underlined["mean_run"] - plain["mean_run"]) < 0.6
 
@@ -757,17 +726,17 @@ def test_ink_dense_thin_not_bold():
     thin   = block_ink_stats(_synthetic_text(1))   # редкие тонкие штрихи
     arr = _np.full((50, 200), 255, dtype=_np.uint8)
     for row0 in (10, 25, 40):
-        for col in range(5, 195, 3):               # плотно, но тонко
+        for col in range(5, 195, 3):
             arr[row0:row0 + 6, col:col + 1] = 0
     dense = block_ink_stats(_PILImage.fromarray(arr))
+    assert thin is not None and dense is not None
     assert abs(dense["stroke_w"] - thin["stroke_w"]) < 0.6
-    assert dense["stroke_density"] > thin["stroke_density"]   # плотность выше…
-    # …но толщина штриха та же — ink отделяет жирность от плотности
-
+    assert dense["stroke_density"] > thin["stroke_density"]  
 
 @_need_np
 def test_ink_values_in_range():
     st = block_ink_stats(_synthetic_text(2))
+    assert st is not None
     assert 0.0 <= st["stroke_density"] <= 1.0
     assert 0.0 <= st["ink_ratio"] <= 1.0
     assert st["stroke_w"] >= 0.0
@@ -779,13 +748,11 @@ def test_ink_blank_is_zero():
     """Чистый белый холст — нулевая насыщенность."""
     blank = _PILImage.fromarray(_np.full((40, 120), 255, dtype=_np.uint8))
     st = block_ink_stats(blank)
+    assert st is not None
     assert st["ink_ratio"] == 0.0
     assert st["stroke_density"] == 0.0
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 #  OCR PREPROCESS — предобработка изображения перед EasyOCR
-# ─────────────────────────────────────────────────────────────────────────────
 
 from docling_dev.ocr_preprocess import preprocess_for_ocr
 

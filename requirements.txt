@@ -1,4 +1,9 @@
-pdf2docx==0.5.13
+# Прямые зависимости конвертера (онлайн-установка, читаемый список).
+# Для ТОЧНОЙ воспроизводимой/офлайн-установки используйте requirements-lock.txt
+# (полный слепок всех 152 пакетов) — см. README.md.
+
+# --- Ядро: конвертация PDF → DOCX ---
+pdf2docx==0.5.13            # нативные PDF (есть текстовый слой)
 PyMuPDF>=1.26.7
 python-docx>=0.8.10
 PyPDF2>=3.0.0
@@ -6,9 +11,19 @@ Pillow>=10.0.0
 opencv-python>=4.6.0
 docxcompose>=1.4.0
 
-# Веб-слой локального API конвертера (main.py + docling_dev/api.py).
-# Ставить офлайн из vendor/wheels:
-#   pip install --no-index --find-links vendor/wheels fastapi uvicorn python-multipart
+# --- OCR для сканов ---
+# Основной движок — Docling + RapidOCR (тяжёлые, ставятся из lock-файла или
+# отдельно). Ниже — опциональный PaddleOCR-движок.
+paddleocr==2.10.0
+# PaddlePaddle ставить под свою ОС/Python отдельно. Пример (Linux CPU):
+#   pip install paddlepaddle -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+
+# --- Веб-слой локального API (main.py + docling_dev/api.py) ---
 fastapi>=0.137
 uvicorn>=0.49
 python-multipart>=0.0.32
+
+# --- Опциональная локальная LLM-доочистка (режим скана / флаг --llm) ---
+# CPU-wheel без компиляции:
+#   pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+llama-cpp-python>=0.3.0

@@ -6,7 +6,7 @@ HTTP-слой конвертера: FastAPI APIRouter.
 Не запускает сервер сам по себе — только описывает эндпоинты. Подключается
 в любой FastAPI-приложение строкой `app.include_router(router)`:
   • локально для разработки — из main.py (см. корень проекта);
-  • в бою — из python-backend/main.py приложения sberAct.
+  • в реальном использовании — из python-backend/main.py приложения sberAct.
 
 Полностью локально, без сетевых вызовов. Логику конвертации не дублирует —
 оборачивает существующие точки входа:
@@ -34,10 +34,12 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/convert", tags=["convert"])
 
-# ── Хранилище задач (в памяти) ───────────────────────────────────────────────
-# job_id → {status, stage, progress, mode, filename, docx_path, error}
-#   status:   queued | running | done | error
-#   progress: 0.0 … 1.0 (грубые отметки — convert_pdf одним блокирующим вызовом)
+"""
+── Хранилище задач
+job_id → {status, stage, progress, mode, filename, docx_path, error}
+  status:   queued | running | done | error
+  progress: 0.0 … 1.0 (грубые отметки — convert_pdf одним блокирующим вызовом)
+"""
 _JOBS: dict[str, dict] = {}
 _JOBS_LOCK = threading.Lock()
 
@@ -48,13 +50,13 @@ _EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="convert")
 _WORK_DIR = Path(tempfile.gettempdir()) / "convert_api_jobs"
 _WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-# Кэш Docling-конвертера: построение тяжёлое (грузит модели), поэтому держим
+# Кэш Docling-конвертера: построение тяжёлое, поэтому держим
 # по одному экземпляру на значение ocr_preprocess (оно меняет pipeline).
 _SCAN_CONVERTERS: dict[bool, object] = {}
 _SCAN_LOCK = threading.Lock()
 
 # Кэш EasyOCR-reader: нужен только для флага word_order (переупорядочивание
-# блоков). Инициализация тяжёлая (грузит модели), поэтому строим лениво один раз.
+# блоков). Инициализация тяжёлая, поэтому строим лениво один раз.
 _OCR_READER: list = []          # [reader] или [] ; None-маркер недоступности — [None]
 _OCR_READER_LOCK = threading.Lock()
 
@@ -91,9 +93,8 @@ def _get_ocr_reader():
                 log.warning("api: EasyOCR недоступен, word_order отключён: %s", exc)
                 _OCR_READER.append(None)
         return _OCR_READER[0]
-
-
-# ── Фоновые воркеры ──────────────────────────────────────────────────────────
+    
+#Фоновые воркеры
 
 def _run_scan(job_id: str, pdf_path: Path, docx_path: Path, flags: dict) -> None:
     """Прогон скана через Docling-пайплайн (медленный путь)."""
@@ -141,9 +142,8 @@ def _run_native(job_id: str, pdf_path: Path, docx_path: Path) -> None:
     except Exception as e:                       # noqa: BLE001
         log.exception("api: ошибка прогона нативного PDF %s", job_id)
         _set(job_id, status="error", stage="Ошибка", error=str(e))
-
-
-# ── Приём загруженного файла ─────────────────────────────────────────────────
+        
+#Приём загруженного файла
 
 def _accept_upload(file: UploadFile) -> tuple[str, Path, Path]:
     """Сохраняет загруженный PDF в папку задачи. Возвращает (job_id, pdf, docx)."""
@@ -163,7 +163,7 @@ def _accept_upload(file: UploadFile) -> tuple[str, Path, Path]:
     return job_id, pdf_path, docx_path
 
 
-# ── Эндпоинты ────────────────────────────────────────────────────────────────
+#Эндпоинты
 
 @router.post("/scan")
 async def convert_scan(
