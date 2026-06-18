@@ -1,6 +1,5 @@
 """
 main.py
-───────
 Локальный dev-сервер конвертера. Поднимает HTTP-API (docling_dev/api.py) на
 127.0.0.1, чтобы разрабатывать и отлаживать React-фронт, не собирая Electron.
 
@@ -23,9 +22,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-# Консоль Windows часто в cp1251 — переключаем stdout на UTF-8 (как в convert_docling_dev.py).
 try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
 except (AttributeError, ValueError):
     pass
 

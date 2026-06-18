@@ -1,6 +1,5 @@
 """
 convert_docling_dev.py
-──────────────────────
 Точка входа для Docling-конвертера (docling_dev/).
 
 Использование:
@@ -21,10 +20,10 @@ import logging
 import sys
 from pathlib import Path
 
-# Консоль Windows часто в cp1251 — переключаем stdout на UTF-8, иначе логи с
-# символами вроде «→»/«×» сыплют «Logging error» (на саму конвертацию не влияет).
 try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    # reconfigure есть только у TextIOWrapper (не у абстрактного TextIO) —
+    # type: ignore гасит статическую претензию, рантайм прикрыт try/except.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
 except (AttributeError, ValueError):
     pass
 

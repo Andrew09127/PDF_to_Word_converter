@@ -12,7 +12,7 @@ from pathlib import Path
 
 # Консоль Windows часто в cp1251 — переключаем вывод на UTF-8.
 try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
 except (AttributeError, ValueError):
     pass
 

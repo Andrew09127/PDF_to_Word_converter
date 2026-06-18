@@ -1,7 +1,3 @@
-// Клиент HTTP-API конвертера. Пути относительные — работают и через Vite-прокси
-// (дев), и при раздаче из FastAPI статикой (бой). В сеть ничего не уходит: бэкенд
-// слушает только 127.0.0.1.
-
 export type ConvertMode = "scan" | "native";
 
 export interface ScanFlags {

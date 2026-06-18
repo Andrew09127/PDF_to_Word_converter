@@ -3,8 +3,6 @@ import ReactDOM from "react-dom/client";
 import { createTheme, CssBaseline, ThemeProvider } from "@mui/material";
 import ScanConverter from "./ScanConverter";
 
-// Тема под фирменную палитру Сбера (зелёный #21A038). В sberAct компонент
-// возьмёт их собственную MUI-тему — здесь она только для автономного dev-запуска.
 const theme = createTheme({
   palette: {
     primary: { main: "#21A038", dark: "#158A2B", light: "#5FBF6E", contrastText: "#fff" },

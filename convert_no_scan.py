@@ -134,7 +134,10 @@ class PDFPipelineConverter:
                 )
 
             converter = Converter(str(pdf_path))
-            converter.convert(str(docx_path), start=0, end=None)
+            # end не указываем — значение по умолчанию в pdf2docx (None = до
+            # последней страницы); явный end=None вызывал бы претензию проверки
+            # типов (в описании типов параметр end объявлен как int).
+            converter.convert(str(docx_path), start=0)
             
             # Получаем размер файла для статистики
             file_size = os.path.getsize(pdf_path) / (1024 * 1024)
@@ -216,7 +219,7 @@ class PDFPipelineConverter:
         logging.info(f"Found {total_found} PDF files in {self.input_folder}")
         
         # Мониторинг дискового пространства
-        def check_disk_space(folder, required_gb=1):
+        def check_disk_space(folder, required_gb: float = 1):
             free_space = shutil.disk_usage(folder).free / (1024**3)
             if free_space < required_gb:
                 logging.warning(f"Low disk space on {folder}: only {free_space:.1f} GB free")
@@ -286,31 +289,29 @@ class PDFPipelineConverter:
         remaining_files = total - current
         eta = remaining_files / rate if rate > 0 else 0
         
-        logging.info(f"📊 Progress: {current}/{total} | "
-                    f"✅ {self.stats['success']} | "
-                    f"❌ {self.stats['failed']} | "
-                    f"⏭️ {self.stats['skipped']} | "
-                    f"📁 Saved: {self.stats['total_size_saved_mb']:.1f} MB | "
-                    f"⚡ {rate:.2f} files/sec | "
-                    f"⏱️ ETA: {eta/60:.1f} min")
+        logging.info(f"Progress: {current}/{total} | "
+                    f"{self.stats['success']} | "
+                    f"{self.stats['failed']} | "
+                    f"{self.stats['skipped']} | "
+                    f"Saved: {self.stats['total_size_saved_mb']:.1f} MB | "
+                    f"{rate:.2f} files/sec | "
+                    f"ETA: {eta/60:.1f} min")
     
     def print_final_stats(self):
         """Вывод финальной статистики"""
         total_time = self.stats['end_time'] - self.stats['start_time']
-        logging.info("\n" + "="*60)
-        logging.info("🎉 CONVERSION PIPELINE COMPLETED 🎉")
-        logging.info("="*60)
-        logging.info(f"⏱️  Total time: {total_time/60:.1f} minutes ({total_time/3600:.2f} hours)")
-        logging.info(f"✅ Successfully converted: {self.stats['success']}")
-        logging.info(f"❌ Failed: {self.stats['failed']}")
-        logging.info(f"⏭️  Skipped: {self.stats['skipped']}")
-        logging.info(f"💾 Total disk space saved: {self.stats['total_size_saved_mb']:.1f} MB")
-        logging.info(f"📊 Average speed: {self.stats['success']/(total_time/3600):.1f} files/hour")
+        logging.info("CONVERSION PIPELINE COMPLETED")
+        logging.info(f"Total time: {total_time/60:.1f} minutes ({total_time/3600:.2f} hours)")
+        logging.info(f"Successfully converted: {self.stats['success']}")
+        logging.info(f"Failed: {self.stats['failed']}")
+        logging.info(f"Skipped: {self.stats['skipped']}")
+        logging.info(f"Total disk space saved: {self.stats['total_size_saved_mb']:.1f} MB")
+        logging.info(f"Average speed: {self.stats['success']/(total_time/3600):.1f} files/hour")
         
         if self.stats['failed'] > 0:
-            logging.warning(f"⚠️  {self.stats['failed']} files failed. Check log for details.")
+            logging.warning(f"{self.stats['failed']} files failed. Check log for details.")
         else:
-            logging.info("✨ All files processed successfully! ✨")
+            logging.info("All files processed successfully")
         logging.info("="*60)
 
 # Запуск конвейера
@@ -356,7 +357,7 @@ def simple_pipeline():
     )
 
 if __name__ == "__main__":
-    # Выберите нужный вариант
+    # 2 варианта запуска
     
     # Вариант 1: Полный с бэкапом (рекомендуется для важных файлов)
     run_conversion_pipeline()
