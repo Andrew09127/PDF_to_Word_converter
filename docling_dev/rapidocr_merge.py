@@ -1,10 +1,9 @@
 """Объединённая детекция RapidOCR на нескольких масштабах (повышение recall).
 
-Проблема: det-модель RapidOCR (даже серверная) на части документов НЕ находит
-часть текстовых строк — текст теряется (на Doc1 пропадало ~80 реальных слов).
-Параметры детекции это не лечат: одни строки находятся на одном масштабе, другие —
-на другом. Объединение проходов на 2 масштабах снижает потери (Doc1: 80 → 50 слов),
-оставаясь ЧИСТЫМ (распознаёт всё та же eslav rec-модель, без шума EasyOCR).
+Проблема: det-модель RapidOCR на части документов НЕ находит
+часть текстовых строк — текст теряется. Параметры детекции это не лечат: одни строки 
+находятся на одном масштабе, другие — на другом. Объединение проходов на 2 масштабах с
+нижает потери, оставаясь ЧИСТЫМ (распознаёт всё та же eslav rec-модель, без шума EasyOCR).
 
 Механизм: оборачиваем `reader` (экземпляр RapidOCR), который Docling зовёт как
 `reader(im, use_det, use_cls, use_rec)`. Обёртка гоняет полный проход (det+cls+rec)
@@ -24,7 +23,7 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
-# Масштабы относительно изображения, которое передаёт Docling (у него scale=3 → 216
+# Масштабы относительно изображения, которое передаёт Docling (у него scale=3 - 216
 # DPI). 1.0 — как есть; 0.667 ≈ эквивалент scale=2 (144 DPI). Эти два прохода в
 # замерах давали максимум прироста (добавление 4-го масштаба уже ничего не давало).
 _MERGE_SCALES: tuple[float, ...] = (1.0, 0.667)
@@ -88,7 +87,7 @@ class MergedReader:
             if r is None or getattr(r, "boxes", None) is None:
                 continue
             for box, txt, score in zip(r.boxes.tolist(), r.txts, r.scores):
-                # координаты найденного бокса → в систему ИСХОДНОГО изображения
+                # координаты найденного бокса - в систему ИСХОДНОГО изображения
                 box = (np.asarray(box, dtype=float) * inv).tolist()
                 if k == 0:
                     # первый (полноразмерный) проход — берём всё как базу
@@ -131,5 +130,5 @@ def install_merged_detection() -> None:
             log.info("merge: объединённая детекция RapidOCR включена (масштабы %s)",
                      _MERGE_SCALES)
 
-    RapidOcrModel.__init__ = _patched_init
-    RapidOcrModel._merged_detection_installed = True
+    setattr(RapidOcrModel, "__init__", _patched_init)
+    setattr(RapidOcrModel, "_merged_detection_installed", True)

@@ -1,6 +1,5 @@
 """
 word_order.py
-─────────────
 Реконструкция правильного порядка слов из результатов EasyOCR.
 
 Проблема: Docling/EasyOCR на скане иногда возвращает текстовые регионы
@@ -20,7 +19,7 @@ import statistics
 from dataclasses import dataclass, field
 
 
-# ── Структуры данных ──────────────────────────────────────────────────────────
+# Структуры данных
 
 @dataclass
 class Word:
@@ -104,7 +103,7 @@ class TextBlock:
         return len(self.lines)
 
 
-# ── Основная функция ──────────────────────────────────────────────────────────
+# Основная функция
 
 def reconstruct_blocks(
     ocr_results: list[tuple],
@@ -148,9 +147,9 @@ def reconstruct_blocks(
     median_h = statistics.median(heights)
     line_tol  = median_h * line_merge_ratio
 
-    # 3. Сортировка: сверху вниз → слева направо
-    #    PDF-native (y=0 снизу): большой mid_y = верх страницы → убывающий порядок
-    #    Screen-coords (y=0 сверху): малый mid_y = верх → возрастающий порядок
+    # 3. Сортировка: сверху вниз - слева направо
+    #    PDF-native (y=0 снизу): большой mid_y = верх страницы - убывающий порядок
+    #    Screen-coords (y=0 сверху): малый mid_y = верх - возрастающий порядок
     words.sort(key=lambda w: (-w.mid_y if pdf_native else w.mid_y))
 
     # 4. Группировка слов в визуальные строки
@@ -203,7 +202,7 @@ def reconstruct_blocks(
     return [b for b in blocks if b.lines]
 
 
-# ── Вспомогательные функции ───────────────────────────────────────────────────
+# Вспомогательные функции 
 
 def get_page_ocr(dl_doc, page_no: int, ocr_reader) -> tuple[list[tuple], float]:
     """

@@ -1,7 +1,7 @@
 """Предобработка изображения перед EasyOCR — поднимает качество распознавания
 плохих сканов (наклон, серый фон, шум, бледность).
 
-КАК ВСТРАИВАЕТСЯ: EasyOCR вызывается ВНУТРИ Docling (EasyOcrModel.__call__ →
+КАК ВСТРАИВАЕТСЯ: EasyOCR вызывается ВНУТРИ Docling (EasyOcrModel.__call__ -
 reader.readtext(im)). Перехватываем `easyocr.Reader.readtext` (monkeypatch) и
 предобрабатываем numpy-изображение перед распознаванием. Одна точка покрывает и
 Docling-OCR, и word_order-проход.
@@ -17,15 +17,22 @@ no-op (OCR работает как раньше).
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 log = logging.getLogger(__name__)
 
-try:
+if TYPE_CHECKING:
+    # Для статического анализатора — реальные модули (без union с None),
+    # чтобы cv2.*/np.* разрешались. В рантайме работает try/except ниже.
     import cv2
     import numpy as np
-except Exception:                       # cv2/numpy всегда есть, но на всякий
-    cv2 = None
-    np = None
+else:
+    try:
+        import cv2
+        import numpy as np
+    except Exception:                   # cv2/numpy всегда есть, но на всякий
+        cv2 = None
+        np = None
 
 _PATCHED = False
 
@@ -69,7 +76,7 @@ def preprocess_for_ocr(
 ):
     """Предобрабатывает numpy-изображение для OCR. Возвращает RGB numpy (3 канала).
 
-    Не-numpy вход (путь/None) или отсутствие cv2 → возвращаем как есть (no-op).
+    Не-numpy вход (путь/None) или отсутствие cv2 - возвращаем как есть (no-op).
     max_skew_deg — углы больше считаем ошибкой детекции (не вращаем).
     """
     if cv2 is None or np is None or not isinstance(image, np.ndarray):

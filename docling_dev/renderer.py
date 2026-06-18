@@ -1,6 +1,5 @@
 """
 renderer.py
-───────────
 Публичный API рендеринга документа.
 
 Оркестрирует pipeline:
@@ -32,7 +31,7 @@ def render_document(
     use_word_order: bool = True,
 ) -> object:
     """
-    Главная точка входа: DoclingDocument → python-docx Document.
+    Главная точка входа: DoclingDocument - python-docx Document.
 
     Параметры:
         dl_doc         — Docling DoclingDocument
