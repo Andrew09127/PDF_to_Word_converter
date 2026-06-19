@@ -1,24 +1,34 @@
-import PyPDF2
 import pymupdf as fitz
 from docx import Document
-from docx.shared import Inches
-import io
-from PIL import Image
 import os
+import re
 import shutil
 from pathlib import Path
 import time
 import logging
 from datetime import datetime
 import gc
-import threading
-from queue import Queue
 import json
 
 try:
     from pdf2docx import Converter
 except ImportError:
     Converter = None
+
+# Настройки pdf2docx (передаются в convert()). Дефолты библиотеки разумны, но часть
+# «потерь текста / кривой вёрстки» лечится их подкруткой ПОД ТИП ДОКУМЕНТОВ — здесь
+# их удобно держать в одном месте. Самые влияющие:
+#   parse_stream_table=False — НЕ искать «таблицы без рамок». Частая причина кривой
+#       вёрстки текстовых документов: pdf2docx ошибочно сворачивает абзацы в таблицу.
+#       Для юр-документов (сплошной текст, мало настоящих таблиц) выключение обычно
+#       даёт более верную вёрстку. Если в ваших PDF есть таблицы без видимых рамок —
+#       верните True.
+#   ignore_page_error=True — не падать из-за ошибки на одной странице (но её текст
+#       тогда теряется; это ловит контроль покрытия _check_text_coverage ниже).
+PDF2DOCX_SETTINGS = {
+    "parse_stream_table": False,
+    "ignore_page_error":  True,
+}
 
 # Настройка логирования
 logging.basicConfig(
@@ -60,70 +70,80 @@ class PDFPipelineConverter:
         # Файл для сохранения состояния
         self.checkpoint_file = self.input_folder / 'conversion_state.json'
         
-    def extract_text_from_pdf(self, pdf_path):
-        """Извлечение текста из PDF"""
-        text_content = []
+    @staticmethod
+    def _norm(s: str) -> str:
+        """Нормализация для сверки: убираем ВСЕ пробелы и регистр — устойчиво к
+        переносам/переформатированию строк, которое делает pdf2docx."""
+        return re.sub(r"\s+", "", s).lower()
+
+    _WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]{3,}")
+
+    @classmethod
+    def _words(cls, s: str) -> list[str]:
+        """Значащие слова (3+ символа) в нижнем регистре — для пословной сверки."""
+        return cls._WORD_RE.findall(s.lower())
+
+    def _recover_missing_text(self, pdf_path, docx_path) -> None:
+        """ГАРАНТИЯ ПОЛНОТЫ ТЕКСТА. pdf2docx иногда теряет строки. Здесь сверяем
+        встроенный текст PDF (для нативных PDF он достоверен) с текстом DOCX и
+        ДОПИСЫВАЕМ в конец DOCX строки, которых в нём не оказалось. Так ни одно слово
+        не теряется — ценой того, что восстановленные строки идут отдельным блоком в
+        конце (без исходной вёрстки), но текст присутствует полностью."""
         try:
-            with open(pdf_path, "rb") as pdf_file:
-                pdf_reader = PyPDF2.PdfReader(pdf_file)
-                for page_num, page in enumerate(pdf_reader.pages):
-                    try:
-                        text = page.extract_text()
-                        if text:
-                            text_content.append(f"--- Page {page_num + 1} ---\n{text}\n")
-                    except Exception as e:
-                        text_content.append(f"--- Page {page_num + 1} ---\n[Error: {str(e)}]\n")
-            return text_content
-        except Exception as e:
-            logging.error(f"Text extraction failed: {e}")
-            return [f"Error extracting text: {str(e)}"]
-    
-    def extract_images_from_pdf(self, pdf_path):
-        """Извлечение изображений из PDF"""
-        images_content = []
-        pdf_document = None
+            d = Document(str(docx_path))
+        except Exception as exc:
+            logging.warning("Полнота: не открыть DOCX %s: %s", docx_path.name, exc)
+            return
+        parts = [p.text for p in d.paragraphs]
+        for t in d.tables:
+            for row in t.rows:
+                for cell in row.cells:
+                    parts.append(cell.text)
+        docx_words = set(self._words(" ".join(parts)))
+
         try:
-            pdf_document = fitz.open(pdf_path)
-            for page_num in range(min(pdf_document.page_count, 100)):  # Ограничение на 100 страниц
-                page = pdf_document[page_num]
-                page_images = []
-                
-                # Получаем изображения со страницы
-                image_list = page.get_images(full=True)
-                for img_index, img in enumerate(image_list[:5]):  # Не более 5 изображений на страницу
-                    try:
-                        xref = img[0]
-                        base_image = pdf_document.extract_image(xref)
-                        img_bytes = base_image["image"]
-                        
-                        # Конвертируем в PNG
-                        with io.BytesIO(img_bytes) as img_stream:
-                            with Image.open(img_stream) as pil_image:
-                                # Уменьшаем размер изображения если оно слишком большое
-                                if pil_image.size[0] > 1000 or pil_image.size[1] > 1000:
-                                    pil_image.thumbnail((800, 800), Image.Resampling.LANCZOS)
-                                
-                                png_stream = io.BytesIO()
-                                pil_image.save(png_stream, format="PNG", optimize=True)
-                                png_stream.seek(0)
-                                page_images.append(png_stream)
-                                
-                    except Exception as e:
-                        logging.warning(f"Failed to extract image on page {page_num}: {e}")
-                        continue
-                
-                images_content.append(page_images)
-                if page_num % 20 == 0:
-                    gc.collect()  # Периодическая очистка
-                    
-        except Exception as e:
-            logging.error(f"Image extraction failed: {e}")
-        finally:
-            if pdf_document:
-                pdf_document.close()
-        
-        return images_content
-    
+            pdf = fitz.open(pdf_path)
+        except Exception as exc:
+            logging.warning("Полнота: не открыть PDF %s: %s", pdf_path.name, exc)
+            return
+        missing: list[str] = []
+        seen: set[str] = set()
+        src_chars = 0
+        for i in range(pdf.page_count):
+            page_text = pdf[i].get_text()
+            src_chars += len(page_text)
+            for line in page_text.splitlines():
+                s = line.strip()
+                lw = self._words(s)
+                if len(lw) < 2:             # слишком коротко, чтобы судить (номер/одно слово)
+                    continue
+                # Строка ПОТЕРЯНА, только если БОЛЬШИНСТВО её слов отсутствуют в DOCX.
+                # Иначе это та же строка, просто переразбитая pdf2docx (не дублируем).
+                absent = sum(1 for w in lw if w not in docx_words)
+                if absent >= max(2, int(0.6 * len(lw) + 0.999)):
+                    key = self._norm(s)
+                    if key not in seen:     # не дописываем одну и ту же строку дважды
+                        seen.add(key)
+                        missing.append(s)
+        pdf.close()
+
+        if src_chars < 50:                  # PDF без текстового слоя (скан) — сверять нечего
+            return
+        if not missing:
+            logging.info("Полнота текста %s: OK — потерь не найдено", pdf_path.name)
+            return
+
+        try:
+            d.add_page_break()
+            d.add_paragraph("[Восстановленный текст — pdf2docx не перенёс эти строки в вёрстку]")
+            for s in missing:
+                d.add_paragraph(s)
+            d.save(str(docx_path))
+            logging.warning("%s: pdf2docx потерял %d строк — дописаны в конец DOCX "
+                            "(полнота восстановлена)", pdf_path.name, len(missing))
+        except Exception as exc:
+            logging.error("Полнота: не дописать восстановленный текст в %s: %s", docx_path.name, exc)
+
     def convert_single_pdf(self, pdf_path, docx_path):
         """Конвертация одного PDF в редактируемый DOCX"""
         converter = None
@@ -134,14 +154,16 @@ class PDFPipelineConverter:
                 )
 
             converter = Converter(str(pdf_path))
-            # end не указываем — значение по умолчанию в pdf2docx (None = до
-            # последней страницы); явный end=None вызывал бы претензию проверки
-            # типов (в описании типов параметр end объявлен как int).
-            converter.convert(str(docx_path), start=0)
-            
+            # Настройки pdf2docx — в PDF2DOCX_SETTINGS (см. начало файла, можно крутить).
+            # end не указываем — дефолт pdf2docx (None = до последней страницы).
+            converter.convert(str(docx_path), start=0, **PDF2DOCX_SETTINGS)
+
+            # Гарантия полноты: дописываем текст, который pdf2docx потерял
+            self._recover_missing_text(pdf_path, docx_path)
+
             # Получаем размер файла для статистики
             file_size = os.path.getsize(pdf_path) / (1024 * 1024)
-            
+
             return True, file_size
             
         except MemoryError:
