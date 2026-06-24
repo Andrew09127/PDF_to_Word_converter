@@ -52,6 +52,19 @@ app.add_middleware(
 app.include_router(converter_router)
 
 
+@app.middleware("http")
+async def _no_cache_html(request, call_next):
+    """
+    Запрещает кэшировать index.html, чтобы после пересборки фронта браузер не
+    держал старую страницу со ссылкой на устаревший бандл. JS/CSS с хэшем в имени
+    кэшируются как обычно — их содержимое меняется только вместе с именем файла.
+    """
+    response = await call_next(request)
+    if response.headers.get("content-type", "").startswith("text/html"):
+        response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}

@@ -165,6 +165,28 @@ def _accept_upload(file: UploadFile) -> tuple[str, Path, Path]:
 
 #Эндпоинты
 
+@router.post("/analyze")
+async def analyze_pdf(file: UploadFile = File(...)):
+    """
+    Быстрое определение типа PDF (скан/нативный) для подсветки рекомендованного
+    режима в интерфейсе. Синхронно, без OCR и без фоновых задач — только чтение
+    текстового слоя. Временный файл удаляется сразу после анализа.
+    """
+    name = Path(file.filename or "document.pdf").name
+    if not name.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Принимаются только PDF-файлы.")
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="analyze_", dir=_WORK_DIR))
+    pdf_path = tmp_dir / name
+    try:
+        with pdf_path.open("wb") as out:
+            shutil.copyfileobj(file.file, out)
+        from .pdf_classifier import classify_pdf
+        return classify_pdf(pdf_path)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 @router.post("/scan")
 async def convert_scan(
     background: BackgroundTasks,

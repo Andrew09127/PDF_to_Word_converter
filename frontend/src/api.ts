@@ -8,6 +8,24 @@ export interface ScanFlags {
   ocr_preprocess: boolean;
 }
 
+export interface AnalyzeResult {
+  suggested: ConvertMode;
+  confidence: "high" | "low";
+  reason: string;
+}
+
+// Быстро определяет тип PDF (скан/нативный), чтобы подсветить рекомендованный режим.
+export async function analyzePdf(file: File): Promise<AnalyzeResult> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await fetch("/convert/analyze", { method: "POST", body: form });
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}));
+    throw new Error(detail.detail || `Анализ не удался (${res.status})`);
+  }
+  return (await res.json()) as AnalyzeResult;
+}
+
 export interface JobStatus {
   job_id: string;
   status: "queued" | "running" | "done" | "error";

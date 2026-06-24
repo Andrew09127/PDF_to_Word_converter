@@ -23,6 +23,7 @@ import CloseIcon from "@mui/icons-material/Close";
 import {
   ConvertMode,
   ScanFlags,
+  analyzePdf,
   downloadResult,
   pollUntilDone,
   startConversion,
@@ -91,7 +92,19 @@ export default function ScanConverter() {
   const [status, setStatus] = useState("Ожидание выбора PDF-файла…");
   const [statusKind, setStatusKind] = useState<"info" | "success" | "error">("info");
   const [dragOver, setDragOver] = useState(false);
+  // Рекомендованный анализатором режим — для подсветки кнопки. null — ещё не определён.
+  const [suggestedMode, setSuggestedMode] = useState<ConvertMode | null>(null);
+  const [analyzing, setAnalyzing] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Сбрасывает выбранный файл и связанное состояние (рекомендацию, прогресс).
+  function clearFile() {
+    setFile(null);
+    setSuggestedMode(null);
+    setProgress(0);
+    setStatus("Ожидание выбора PDF-файла…");
+    setStatusKind("info");
+  }
 
   function pickFile(f: File | null) {
     if (!f) return;
@@ -102,8 +115,21 @@ export default function ScanConverter() {
     }
     setFile(f);
     setProgress(0);
-    setStatus("PDF добавлен. Выберите режим конвертации.");
+    setSuggestedMode(null);
     setStatusKind("info");
+    setStatus("Определяем тип документа…");
+    setAnalyzing(true);
+    // Лёгкий синхронный анализ на бэке (без OCR) — подсветит рекомендованный режим.
+    analyzePdf(f)
+      .then((res) => {
+        setSuggestedMode(res.suggested);
+        setStatus(res.reason);
+      })
+      .catch(() => {
+        // Анализ не критичен: при сбое просто не подсвечиваем, режим выбирает пользователь.
+        setStatus("PDF добавлен. Выберите режим конвертации.");
+      })
+      .finally(() => setAnalyzing(false));
   }
 
   async function convert(mode: ConvertMode) {
@@ -194,8 +220,7 @@ export default function ScanConverter() {
                   color="primary"
                   variant="outlined"
                   label={file.name}
-                  onDelete={busy ? undefined : () => { setFile(null); setProgress(0);
-                    setStatus("Ожидание выбора PDF-файла…"); setStatusKind("info"); }}
+                  onDelete={busy ? undefined : clearFile}
                   deleteIcon={<CloseIcon />}
                 />
               </Box>
@@ -323,16 +348,26 @@ export default function ScanConverter() {
 
           <Alert severity={statusKind} variant="outlined">{status}</Alert>
 
-          {/* Две карточки режимов с пояснениями */}
+          {/* Две карточки режимов с пояснениями.
+              Анализатор подсвечивает рекомендованную карточку зелёной рамкой и делает
+              её кнопку «success»-зелёной; обе кнопки остаются активны — выбор за пользователем. */}
           <Stack direction={{ xs: "column", sm: "row" }} spacing={2} alignItems="stretch">
             {/* Скан-режим */}
-            <Box sx={{ flex: 1, p: 2, border: "1px solid #E5E7EB", borderRadius: 2,
-                       display: "flex", flexDirection: "column" }}>
+            {(() => {
+              const recommended = suggestedMode === "scan";
+              return (
+            <Box sx={{ flex: 1, p: 2, borderRadius: 2, display: "flex", flexDirection: "column",
+                       border: "2px solid", borderColor: recommended ? "success.main" : "#E5E7EB",
+                       bgcolor: recommended ? "#F0FBF2" : "#fff", transition: "all .2s" }}>
               <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 0.5 }}>
                 <PsychologyIcon color="primary" fontSize="small" />
                 <Typography variant="subtitle2" fontWeight={700}>
                   Отсканированный PDF
                 </Typography>
+                {recommended && (
+                  <Chip label="рекомендуем" size="small" color="success"
+                        sx={{ ml: "auto", fontWeight: 600, height: 20 }} />
+                )}
               </Box>
               <Typography variant="caption" color="text.secondary" sx={{ mb: 1.5, flexGrow: 1 }}>
                 Для документов-изображений (фото и сканы), где текст нельзя выделить.
@@ -342,23 +377,34 @@ export default function ScanConverter() {
               <Button
                 fullWidth
                 size="large"
-                variant="contained"
+                variant={recommended ? "contained" : "outlined"}
+                color={recommended ? "success" : "primary"}
                 startIcon={<PsychologyIcon />}
-                disabled={!file || busy}
+                disabled={!file || busy || analyzing}
                 onClick={() => convert("scan")}
               >
                 Конвертировать скан
               </Button>
             </Box>
+              );
+            })()}
 
             {/* Нативный режим */}
-            <Box sx={{ flex: 1, p: 2, border: "1px solid #E5E7EB", borderRadius: 2,
-                       display: "flex", flexDirection: "column" }}>
+            {(() => {
+              const recommended = suggestedMode === "native";
+              return (
+            <Box sx={{ flex: 1, p: 2, borderRadius: 2, display: "flex", flexDirection: "column",
+                       border: "2px solid", borderColor: recommended ? "success.main" : "#E5E7EB",
+                       bgcolor: recommended ? "#F0FBF2" : "#fff", transition: "all .2s" }}>
               <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 0.5 }}>
                 <DescriptionIcon color="primary" fontSize="small" />
                 <Typography variant="subtitle2" fontWeight={700}>
                   Неотсканированный PDF
                 </Typography>
+                {recommended && (
+                  <Chip label="рекомендуем" size="small" color="success"
+                        sx={{ ml: "auto", fontWeight: 600, height: 20 }} />
+                )}
               </Box>
               <Typography variant="caption" color="text.secondary" sx={{ mb: 1.5, flexGrow: 1 }}>
                 Для документов с текстовым слоем (текст выделяется и копируется).
@@ -368,14 +414,17 @@ export default function ScanConverter() {
               <Button
                 fullWidth
                 size="large"
-                variant="outlined"
+                variant={recommended ? "contained" : "outlined"}
+                color={recommended ? "success" : "primary"}
                 startIcon={<DescriptionIcon />}
-                disabled={!file || busy}
+                disabled={!file || busy || analyzing}
                 onClick={() => convert("native")}
               >
                 Конвертировать PDF
               </Button>
             </Box>
+              );
+            })()}
           </Stack>
         </Stack>
       </Paper>
