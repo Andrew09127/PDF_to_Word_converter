@@ -9,6 +9,7 @@ import logging
 from datetime import datetime
 import gc
 import json
+from itertools import groupby
 
 try:
     from pdf2docx import Converter
@@ -144,6 +145,133 @@ class PDFPipelineConverter:
         except Exception as exc:
             logging.error("Полнота: не дописать восстановленный текст в %s: %s", docx_path.name, exc)
 
+    # Длина окна n-грамм: сколько подряд идущих слов PDF склеиваем в один ключ.
+    # 6 покрывает реальные склейки pdf2docx (обычно 2-4 слова) с запасом.
+    _GLUE_MAX_N = 6
+
+    @classmethod
+    def _build_glue_map(cls, pdf) -> dict[str, list[int]]:
+        """КАРТА РЕАЛЬНЫХ СКЛЕЕК. Берём слова PDF (PyMuPDF расставляет пробелы по
+        координатам корректно), группируем по строкам (block, line) и генерируем
+        конкатенации подряд идущих слов. Ключ — склеенная форма в нижнем регистре,
+        значение — позиции границ (куда вставлять пробелы).
+
+        Расклеиваем ТОЛЬКО то, что реально стояло рядом в исходнике, — никакой
+        словарной сегментации, поэтому корректные слова не шинкуются."""
+        glue: dict[str, list[int]] = {}
+        singles: set[str] = set()           # самостоятельные слова PDF — их НЕ трогаем
+        for page in pdf:
+            # (x0, y0, x1, y1, "word", block_no, line_no, word_no)
+            words = page.get_text("words")
+            words.sort(key=lambda w: (w[5], w[6], w[7]))
+            for _, line in groupby(words, key=lambda w: (w[5], w[6])):
+                toks = [w[4] for w in line]
+                for i in range(len(toks)):
+                    acc, bounds = "", []
+                    for n in range(1, cls._GLUE_MAX_N + 1):
+                        if i + n > len(toks):
+                            break
+                        if n > 1:
+                            bounds.append(len(acc))   # граница перед очередным словом
+                        acc += toks[i + n - 1]
+                        if n == 1:
+                            singles.add(acc.lower())
+                        else:
+                            # setdefault: при коллизии оставляем самую короткую (раннюю)
+                            # разбивку — она однозначнее
+                            glue.setdefault(acc.lower(), list(bounds))
+        # Защита от ложных разрезов: если склеенная форма совпадает с реальным
+        # самостоятельным словом (напр. «дело» = «дел» + «о»), не расклеиваем его.
+        for key in singles:
+            glue.pop(key, None)
+        return glue
+
+    @staticmethod
+    def _unglue(token: str, glue: dict[str, list[int]]) -> str:
+        """Вставляет пробелы в склеенный токен по известным из PDF границам.
+        Символы DOCX не заменяются — сохраняется точный регистр/написание."""
+        bounds = glue.get(token.lower())
+        if not bounds:
+            return token
+        parts, prev = [], 0
+        for b in bounds:
+            parts.append(token[prev:b])
+            prev = b
+        parts.append(token[prev:])
+        return " ".join(p for p in parts if p)
+
+    def _fix_paragraph(self, paragraph, glue: dict[str, list[int]]) -> int:
+        """Чинит склейки в одном абзаце на двух уровнях:
+        1) внутри run (pdf2docx склеил слова в одном фрагменте текста);
+        2) на стыке соседних runs (слова в разных фрагментах без пробела между ними
+           — частый случай: «1.» + «Включить» → визуально «1.Включить»).
+        Возвращает число изменённых мест."""
+        changed = 0
+        runs = paragraph.runs
+
+        # (1) внутрирунные склейки
+        for run in runs:
+            toks = run.text.split(" ")
+            new = [self._unglue(t, glue) if t else t for t in toks]
+            if new != toks:
+                run.text = " ".join(new)
+                changed += 1
+
+        # (2) склейки на границе соседних runs — вставляем пробел в стык, только
+        # если конкатенация хвоста и головы совпадает с известной границей из PDF
+        for i in range(len(runs) - 1):
+            left, right = runs[i].text, runs[i + 1].text
+            if not left or not right or left[-1].isspace() or right[0].isspace():
+                continue
+            a = left.rsplit(" ", 1)[-1]     # последний токен левого run
+            b = right.split(" ", 1)[0]      # первый токен правого run
+            bounds = glue.get((a + b).lower())
+            if bounds and len(a) in bounds:
+                runs[i + 1].text = " " + right
+                changed += 1
+
+        return changed
+
+    def _fix_glued_words(self, pdf_path, docx_path) -> None:
+        """ИСПРАВЛЕНИЕ СКЛЕЕННЫХ СЛОВ. pdf2docx иногда теряет пробелы между словами
+        (особенность реконструкции текста по координатам глифов). Строим карту
+        реальных склеек из PDF и точечно вставляем недостающие пробелы в DOCX."""
+        try:
+            pdf = fitz.open(pdf_path)
+        except Exception as exc:
+            logging.warning("Расклейка: не открыть PDF %s: %s", pdf_path.name, exc)
+            return
+        try:
+            glue = self._build_glue_map(pdf)
+        finally:
+            pdf.close()
+        if not glue:                        # нет текстового слоя (скан) — расклеивать нечего
+            return
+
+        try:
+            d = Document(str(docx_path))
+        except Exception as exc:
+            logging.warning("Расклейка: не открыть DOCX %s: %s", docx_path.name, exc)
+            return
+
+        changed = 0
+
+        for paragraph in d.paragraphs:
+            changed += self._fix_paragraph(paragraph, glue)
+        for table in d.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for paragraph in cell.paragraphs:
+                        changed += self._fix_paragraph(paragraph, glue)
+
+        if changed:
+            try:
+                d.save(str(docx_path))
+                logging.info("Расклейка %s: исправлено runs с пробелами — %d",
+                             pdf_path.name, changed)
+            except Exception as exc:
+                logging.error("Расклейка: не сохранить %s: %s", docx_path.name, exc)
+
     def convert_single_pdf(self, pdf_path, docx_path):
         """Конвертация одного PDF в редактируемый DOCX"""
         converter = None
@@ -157,6 +285,11 @@ class PDFPipelineConverter:
             # Настройки pdf2docx — в PDF2DOCX_SETTINGS (см. начало файла, можно крутить).
             # end не указываем — дефолт pdf2docx (None = до последней страницы).
             converter.convert(str(docx_path), start=0, **PDF2DOCX_SETTINGS)
+
+            # Расклейка: возвращаем пробелы, потерянные pdf2docx между словами.
+            # ВАЖНО до _recover_missing_text — расклеенный текст лучше сверяется
+            # пословно, поэтому ложных «потерь» меньше.
+            self._fix_glued_words(pdf_path, docx_path)
 
             # Гарантия полноты: дописываем текст, который pdf2docx потерял
             self._recover_missing_text(pdf_path, docx_path)
